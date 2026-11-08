@@ -1,0 +1,373 @@
+{
+  "entities": {
+    "CampusBuilding": {
+      "title": "CampusBuilding",
+      "description": "Verified VFSTR campus building or emergency facility record.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique building identifier."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Display name of the campus building."
+        },
+        "shortName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "description": "Short label for map markers."
+        },
+        "officialName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Official VFSTR architectural name."
+        },
+        "category": {
+          "type": "string",
+          "enum": ["ACADEMIC", "ADMINISTRATION", "HOSTEL", "DINING", "LIBRARY", "AMENITY"],
+          "description": "Facility category."
+        },
+        "lat": {
+          "type": "number",
+          "description": "WGS84 latitude in decimal degrees."
+        },
+        "lng": {
+          "type": "number",
+          "description": "WGS84 longitude in decimal degrees."
+        },
+        "dataSource": {
+          "type": "string",
+          "enum": ["OSM_OVERPASS", "ADMIN_VERIFIED", "GOOGLE_MAPS_PLACES"],
+          "description": "Geographic provenance."
+        },
+        "verificationStatus": {
+          "type": "string",
+          "enum": ["OSM_EXTRACTED", "ADMIN_VERIFIED", "UNVERIFIED_NEEDS_PIN", "GOOGLE_PLACES_VERIFIED"],
+          "description": "Verification state."
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 600,
+          "description": "Facility description and emergency assistance capability."
+        },
+        "updatedByUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the admin who created or updated this record."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "shortName",
+        "officialName",
+        "category",
+        "lat",
+        "lng",
+        "dataSource",
+        "verificationStatus",
+        "description",
+        "updatedByUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CampusPathway": {
+      "title": "CampusPathway",
+      "description": "Admin-verified walkable campus pathway or road segment override.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique pathway identifier."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Pathway name."
+        },
+        "highwayType": {
+          "type": "string",
+          "enum": ["primary", "secondary", "tertiary", "residential", "service", "footway", "pedestrian", "path", "cycleway", "steps"],
+          "description": "OSM highway classification."
+        },
+        "allowWalking": {
+          "type": "boolean",
+          "description": "Whether pedestrians can traverse this segment."
+        },
+        "allowBicycle": {
+          "type": "boolean",
+          "description": "Whether bicycles can traverse this segment."
+        },
+        "allowVehicle": {
+          "type": "boolean",
+          "description": "Whether motor vehicles can traverse this segment."
+        },
+        "oneWay": {
+          "type": "boolean",
+          "description": "Whether segment is one-way."
+        },
+        "isAccessible": {
+          "type": "boolean",
+          "description": "False if marked inaccessible/closed by admin."
+        },
+        "coordinatesLat": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Comma-separated latitudes for vertices."
+        },
+        "coordinatesLng": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Comma-separated longitudes for vertices."
+        },
+        "createdByUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of admin who created the pathway."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "highwayType",
+        "allowWalking",
+        "allowBicycle",
+        "allowVehicle",
+        "oneWay",
+        "isAccessible",
+        "coordinatesLat",
+        "coordinatesLng",
+        "createdByUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CampusIncident": {
+      "title": "CampusIncident",
+      "description": "Campus path obstruction, closure, or emergency hazard report.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Incident identifier."
+        },
+        "edgeId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Affected graph edge ID."
+        },
+        "roadName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Affected road or footpath name."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["ROAD_BLOCK", "PEDESTRIAN_CROWD", "VEHICLE_BREAKDOWN", "MEDICAL_EMERGENCY", "CONSTRUCTION", "WATERLOGGING"],
+          "description": "Incident type."
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["LOW", "MODERATE", "HIGH", "CRITICAL"],
+          "description": "Severity level."
+        },
+        "verificationStatus": {
+          "type": "string",
+          "enum": ["UNVERIFIED", "ADMIN_CONFIRMED", "RESOLVED", "REJECTED"],
+          "description": "Verification status."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Short incident title."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 600,
+          "description": "Detailed incident description."
+        },
+        "lat": {
+          "type": "number",
+          "description": "Incident latitude."
+        },
+        "lng": {
+          "type": "number",
+          "description": "Incident longitude."
+        },
+        "reporterUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the authenticated user who reported the incident."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "id",
+        "edgeId",
+        "roadName",
+        "type",
+        "severity",
+        "verificationStatus",
+        "title",
+        "description",
+        "lat",
+        "lng",
+        "reporterUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserPreference": {
+      "title": "UserPreference",
+      "description": "Per-user navigation preferences including walking speed and routing algorithm.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner user UID."
+        },
+        "defaultAlgorithm": {
+          "type": "string",
+          "enum": ["DIJKSTRA", "ASTAR", "BFS", "DFS"],
+          "description": "Preferred shortest-path algorithm."
+        },
+        "defaultMetric": {
+          "type": "string",
+          "enum": ["TIME", "DISTANCE"],
+          "description": "Optimization metric."
+        },
+        "defaultRoutingProfile": {
+          "type": "string",
+          "enum": ["WALKING", "BICYCLE", "VEHICLE"],
+          "description": "Preferred campus travel mode."
+        },
+        "walkingSpeedMps": {
+          "type": "number",
+          "description": "Configurable walking speed in meters per second (0.5 to 3.5)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "userId",
+        "defaultAlgorithm",
+        "defaultMetric",
+        "defaultRoutingProfile",
+        "walkingSpeedMps",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Trusted administrator membership document.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Admin user UID."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["CAMPUS_GIS_ADMIN"],
+          "description": "Admin role identifier."
+        },
+        "grantedByUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of admin who granted access."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        }
+      },
+      "required": ["uid", "role", "grantedByUid", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/campusBuildings/{buildingId}": {
+      "schema": { "$ref": "#/entities/CampusBuilding" },
+      "description": "Verified VFSTR campus buildings and emergency facilities."
+    },
+    "/campusPathways/{pathwayId}": {
+      "schema": { "$ref": "#/entities/CampusPathway" },
+      "description": "Admin-verified custom walkable pathways and accessibility overrides."
+    },
+    "/campusIncidents/{incidentId}": {
+      "schema": { "$ref": "#/entities/CampusIncident" },
+      "description": "Campus path obstructions and incident reports."
+    },
+    "/userPreferences/{userId}": {
+      "schema": { "$ref": "#/entities/UserPreference" },
+      "description": "Private per-user navigation settings and walking speed."
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Registry of authorized VFSTR Campus GIS administrators."
+    }
+  }
+}

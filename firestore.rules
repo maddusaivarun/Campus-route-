@@ -1,0 +1,196 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Reusable Hardened Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        request.auth.token.email == 'madduvarun5@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // 3. Validation Blueprints (Anti-Update-Gap)
+    function isValidCampusBuilding(data) {
+      return data.keys().hasAll([
+        'id', 'name', 'shortName', 'officialName', 'category',
+        'lat', 'lng', 'dataSource', 'verificationStatus',
+        'description', 'updatedByUid', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'name', 'shortName', 'officialName', 'category',
+        'lat', 'lng', 'dataSource', 'verificationStatus',
+        'description', 'updatedByUid', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
+      data.shortName is string && data.shortName.size() >= 1 && data.shortName.size() <= 60 &&
+      data.officialName is string && data.officialName.size() >= 1 && data.officialName.size() <= 200 &&
+      data.category in ['ACADEMIC', 'ADMINISTRATION', 'HOSTEL', 'DINING', 'LIBRARY', 'AMENITY'] &&
+      data.lat is number && data.lat >= 16.20 && data.lat <= 16.26 &&
+      data.lng is number && data.lng >= 80.52 && data.lng <= 80.58 &&
+      data.dataSource in ['OSM_OVERPASS', 'ADMIN_VERIFIED', 'GOOGLE_MAPS_PLACES'] &&
+      data.verificationStatus in ['OSM_EXTRACTED', 'ADMIN_VERIFIED', 'UNVERIFIED_NEEDS_PIN', 'GOOGLE_PLACES_VERIFIED'] &&
+      data.description is string && data.description.size() <= 600 &&
+      isValidId(data.updatedByUid) && data.updatedByUid == request.auth.uid &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidCampusPathway(data) {
+      return data.keys().hasAll([
+        'id', 'name', 'highwayType', 'allowWalking', 'allowBicycle',
+        'allowVehicle', 'oneWay', 'isAccessible', 'coordinatesLat',
+        'coordinatesLng', 'createdByUid', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'name', 'highwayType', 'allowWalking', 'allowBicycle',
+        'allowVehicle', 'oneWay', 'isAccessible', 'coordinatesLat',
+        'coordinatesLng', 'createdByUid', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
+      data.highwayType in ['primary', 'secondary', 'tertiary', 'residential', 'service', 'footway', 'pedestrian', 'path', 'cycleway', 'steps'] &&
+      data.allowWalking is bool &&
+      data.allowBicycle is bool &&
+      data.allowVehicle is bool &&
+      data.oneWay is bool &&
+      data.isAccessible is bool &&
+      data.coordinatesLat is string && data.coordinatesLat.size() >= 3 && data.coordinatesLat.size() <= 2000 &&
+      data.coordinatesLng is string && data.coordinatesLng.size() >= 3 && data.coordinatesLng.size() <= 2000 &&
+      isValidId(data.createdByUid) && data.createdByUid == request.auth.uid &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidCampusIncident(data) {
+      return data.keys().hasAll([
+        'id', 'edgeId', 'roadName', 'type', 'severity',
+        'verificationStatus', 'title', 'description',
+        'lat', 'lng', 'reporterUid', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'edgeId', 'roadName', 'type', 'severity',
+        'verificationStatus', 'title', 'description',
+        'lat', 'lng', 'reporterUid', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.edgeId is string && data.edgeId.size() >= 1 && data.edgeId.size() <= 128 &&
+      data.roadName is string && data.roadName.size() >= 1 && data.roadName.size() <= 160 &&
+      data.type in ['ROAD_BLOCK', 'PEDESTRIAN_CROWD', 'VEHICLE_BREAKDOWN', 'MEDICAL_EMERGENCY', 'CONSTRUCTION', 'WATERLOGGING'] &&
+      data.severity in ['LOW', 'MODERATE', 'HIGH', 'CRITICAL'] &&
+      data.verificationStatus in ['UNVERIFIED', 'ADMIN_CONFIRMED', 'RESOLVED', 'REJECTED'] &&
+      data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+      data.description is string && data.description.size() >= 1 && data.description.size() <= 600 &&
+      data.lat is number && data.lat >= 16.20 && data.lat <= 16.26 &&
+      data.lng is number && data.lng >= 80.52 && data.lng <= 80.58 &&
+      isValidId(data.reporterUid) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidUserPreference(data) {
+      return data.keys().hasAll([
+        'userId', 'defaultAlgorithm', 'defaultMetric',
+        'defaultRoutingProfile', 'walkingSpeedMps', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'userId', 'defaultAlgorithm', 'defaultMetric',
+        'defaultRoutingProfile', 'walkingSpeedMps', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.userId) && data.userId == request.auth.uid &&
+      data.defaultAlgorithm in ['DIJKSTRA', 'ASTAR', 'BFS', 'DFS'] &&
+      data.defaultMetric in ['TIME', 'DISTANCE'] &&
+      data.defaultRoutingProfile in ['WALKING', 'BICYCLE', 'VEHICLE'] &&
+      data.walkingSpeedMps is number && data.walkingSpeedMps >= 0.5 && data.walkingSpeedMps <= 3.5 &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidAdminRecord(data) {
+      return data.keys().hasAll(['uid', 'role', 'grantedByUid', 'createdAt']) &&
+      data.keys().hasOnly(['uid', 'role', 'grantedByUid', 'createdAt']) &&
+      isValidId(data.uid) &&
+      data.role == 'CAMPUS_GIS_ADMIN' &&
+      isValidId(data.grantedByUid) && data.grantedByUid == request.auth.uid &&
+      data.createdAt is timestamp;
+    }
+
+    // 4. Collection Match Blocks
+    match /campusBuildings/{buildingId} {
+      allow get: if isValidId(buildingId) && isSignedIn() && existing().verificationStatus in ['OSM_EXTRACTED', 'ADMIN_VERIFIED', 'UNVERIFIED_NEEDS_PIN', 'GOOGLE_PLACES_VERIFIED'];
+      allow list: if isSignedIn() && existing().verificationStatus in ['OSM_EXTRACTED', 'ADMIN_VERIFIED', 'UNVERIFIED_NEEDS_PIN', 'GOOGLE_PLACES_VERIFIED'];
+      allow create: if isValidId(buildingId) && isValidCampusBuilding(incoming()) && incoming().id == buildingId && incoming().createdAt == request.time && incoming().updatedAt == request.time && isAdmin();
+      allow update: if isValidId(buildingId) && isValidCampusBuilding(incoming()) && incoming().id == existing().id && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'shortName', 'officialName', 'category', 'lat', 'lng', 'dataSource', 'verificationStatus', 'description', 'updatedByUid', 'updatedAt']);
+      allow delete: if isValidId(buildingId) && isAdmin();
+    }
+
+    match /campusPathways/{pathwayId} {
+      allow get: if isValidId(pathwayId) && isSignedIn() && existing().allowWalking is bool;
+      allow list: if isSignedIn() && existing().allowWalking is bool;
+      allow create: if isValidId(pathwayId) && isValidCampusPathway(incoming()) && incoming().id == pathwayId && incoming().createdAt == request.time && incoming().updatedAt == request.time && isAdmin();
+      allow update: if isValidId(pathwayId) && isValidCampusPathway(incoming()) && incoming().id == existing().id && incoming().createdByUid == existing().createdByUid && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'highwayType', 'allowWalking', 'allowBicycle', 'allowVehicle', 'oneWay', 'isAccessible', 'coordinatesLat', 'coordinatesLng', 'updatedAt']);
+      allow delete: if isValidId(pathwayId) && isAdmin();
+    }
+
+    match /campusIncidents/{incidentId} {
+      allow get: if isValidId(incidentId) && isSignedIn() && existing().verificationStatus in ['UNVERIFIED', 'ADMIN_CONFIRMED', 'RESOLVED', 'REJECTED'];
+      allow list: if isSignedIn() && existing().verificationStatus in ['UNVERIFIED', 'ADMIN_CONFIRMED', 'RESOLVED', 'REJECTED'];
+      allow create: if isValidId(incidentId) && isVerifiedUser() && isValidCampusIncident(incoming()) && incoming().id == incidentId && incoming().reporterUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && (incoming().verificationStatus == 'UNVERIFIED' || isAdmin());
+      allow update: if isValidId(incidentId) && isVerifiedUser() && isValidCampusIncident(incoming()) && incoming().id == existing().id && incoming().reporterUid == existing().reporterUid && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && (
+        isAdmin() || (
+          existing().reporterUid == request.auth.uid &&
+          !(existing().verificationStatus in ['RESOLVED', 'REJECTED']) &&
+          incoming().verificationStatus == 'RESOLVED' &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['verificationStatus', 'updatedAt'])
+        )
+      );
+      allow delete: if isValidId(incidentId) && isAdmin();
+    }
+
+    match /userPreferences/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId) && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && existing().userId == request.auth.uid;
+      allow create: if isValidId(userId) && isOwner(userId) && isValidUserPreference(incoming()) && incoming().userId == userId && incoming().createdAt == request.time && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId) && isOwner(userId) && isValidUserPreference(incoming()) && incoming().userId == existing().userId && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && incoming().diff(existing()).affectedKeys().hasOnly(['defaultAlgorithm', 'defaultMetric', 'defaultRoutingProfile', 'walkingSpeedMps', 'updatedAt']);
+      allow delete: if isValidId(userId) && isOwner(userId);
+    }
+
+    match /admins/{adminUid} {
+      allow get: if isValidId(adminUid) && (isOwner(adminUid) || isAdmin()) && existing().role == 'CAMPUS_GIS_ADMIN';
+      allow list: if isAdmin() && existing().role == 'CAMPUS_GIS_ADMIN';
+      allow create: if isValidId(adminUid) && isValidAdminRecord(incoming()) && incoming().uid == adminUid && incoming().createdAt == request.time && isAdmin();
+      allow update: if false;
+      allow delete: if isValidId(adminUid) && isAdmin();
+    }
+  }
+}

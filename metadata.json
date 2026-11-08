@@ -1,0 +1,6 @@
+{
+  "name": "ResQRoute – Intelligent Emergency & Smart Traffic Navigation System",
+  "description": "Smart-city and campus emergency traffic command dashboard featuring live navigation, green-wave signal control, route comparison, and interactive DSA graph pathfinding visualization for VFSTR demonstration locations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
