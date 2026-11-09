@@ -27,6 +27,22 @@ import {
   ExternalLink,
 } from 'lucide-react';
 
+export interface LiveMovingNavMarkerProps {
+  lat: number;
+  lng: number;
+  headingDegrees: number;
+  speedMps: number;
+  progressPercent: number;
+  nextInstruction?: string;
+}
+
+export interface CustomMapEndpoint {
+  lat: number;
+  lng: number;
+  label: string;
+  placeId?: string;
+}
+
 export interface CampusMapCanvasProps {
   graph: CampusGraph;
   buildings?: CampusBuildingEntry[];
@@ -35,21 +51,32 @@ export interface CampusMapCanvasProps {
   gpsState?: GpsPositionState;
   selectedSourceId?: string;
   selectedTargetId?: string;
+  customOriginPoint?: CustomMapEndpoint | null;
+  customDestinationPoint?: CustomMapEndpoint | null;
   highlightedNodePath?: string[];
   highlightedEdgePath?: string[];
   routeGeometry?: [number, number][];
+  traveledRouteGeometry?: [number, number][];
   remainingRouteGeometry?: [number, number][];
+  liveNavMarker?: LiveMovingNavMarkerProps | null;
+  followCamera?: boolean;
   secondaryNodePath?: string[];
   secondaryEdgePath?: string[];
+  secondaryRouteGeometry?: [number, number][];
   visitedNodes?: string[];
   frontierNodes?: string[];
   activeCurrentNode?: string | null;
   activeCurrentEdge?: string | null;
   emergencyMode?: boolean;
+  defaultShowRoadNetworkLayer?: boolean;
   onSelectNode?: (nodeId: string) => void;
   onSelectBuilding?: (building: CampusBuildingEntry, role?: 'ORIGIN' | 'DESTINATION') => void;
   onSelectEdge?: (edge: GraphEdge) => void;
   onMapCoordinateClick?: (lat: number, lng: number) => void;
+  onSetCustomEndpoint?: (
+    point: CustomMapEndpoint,
+    role: 'ORIGIN' | 'DESTINATION' | 'LIVE_POSITION'
+  ) => void;
   onSnapBuildingToPlace?: (buildingId: string, place: GoogleLivePlaceResult) => void;
   interactive?: boolean;
   compact?: boolean;
@@ -59,8 +86,9 @@ export interface CampusMapCanvasProps {
 }
 
 /**
- * Imperative Google Maps overlay manager for Polylines (Active Google Route, Campus Corridors,
- * Secondary Comparison Routes), Building Footprints, GPS Accuracy Circle, and Live Google TrafficLayer.
+ * Imperative Google Maps overlay manager for Polylines (Active Google Route, Traveled vs Remaining Route,
+ * Secondary Comparison Routes, Optional Campus Graph Overlay), Building Footprints, GPS Accuracy Circle,
+ * and Live Google TrafficLayer.
  */
 const GoogleMapImperativeOverlays: React.FC<{
   graph: CampusGraph;
@@ -68,8 +96,12 @@ const GoogleMapImperativeOverlays: React.FC<{
   gpsState?: GpsPositionState;
   highlightedEdgePath: string[];
   secondaryEdgePath: string[];
+  secondaryRouteGeometry: [number, number][];
   routeGeometry: [number, number][];
+  traveledRouteGeometry: [number, number][];
   remainingRouteGeometry: [number, number][];
+  liveNavMarker?: LiveMovingNavMarkerProps | null;
+  followCamera: boolean;
   activeCurrentEdge: string | null;
   emergencyMode: boolean;
   showRoadNetworkLayer: boolean;
@@ -85,8 +117,12 @@ const GoogleMapImperativeOverlays: React.FC<{
   gpsState,
   highlightedEdgePath,
   secondaryEdgePath,
+  secondaryRouteGeometry,
   routeGeometry,
+  traveledRouteGeometry,
   remainingRouteGeometry,
+  liveNavMarker,
+  followCamera,
   activeCurrentEdge,
   emergencyMode,
   showRoadNetworkLayer,
@@ -129,24 +165,32 @@ const GoogleMapImperativeOverlays: React.FC<{
     if (routeGeometry && routeGeometry.length >= 2) {
       const bounds = new google.maps.LatLngBounds();
       routeGeometry.forEach(([lat, lng]) => bounds.extend({ lat, lng }));
-      map.fitBounds(bounds, 48);
+      map.fitBounds(bounds, 56);
     }
   }, [map, fitRouteTrigger, routeGeometry]);
 
-  // Recenter on live GPS position when requested
+  // Smooth Camera Follow during Live Navigation
+  useEffect(() => {
+    if (!map || !followCamera || !liveNavMarker) return;
+    map.panTo({ lat: liveNavMarker.lat, lng: liveNavMarker.lng });
+  }, [map, followCamera, liveNavMarker?.lat, liveNavMarker?.lng]);
+
+  // Recenter on live GPS or Active Navigation position when requested
   useEffect(() => {
     if (!map || recenterGpsTrigger === 0) return;
-    if (gpsState && gpsState.lat !== null && gpsState.lng !== null) {
+    if (liveNavMarker) {
+      map.panTo({ lat: liveNavMarker.lat, lng: liveNavMarker.lng });
+      map.setZoom(18);
+    } else if (gpsState && gpsState.lat !== null && gpsState.lng !== null) {
       map.panTo({ lat: gpsState.lat, lng: gpsState.lng });
       map.setZoom(18);
     }
-  }, [map, recenterGpsTrigger, gpsState]);
+  }, [map, recenterGpsTrigger, gpsState, liveNavMarker]);
 
   // Render Polylines, Footprints, and GPS Circle on Google Map
   useEffect(() => {
     if (!map || typeof google === 'undefined') return;
 
-    // Clean up previous overlays
     polylinesRef.current.forEach((p) => p.setMap(null));
     polylinesRef.current = [];
     polygonsRef.current.forEach((p) => p.setMap(null));
@@ -175,7 +219,7 @@ const GoogleMapImperativeOverlays: React.FC<{
       }
     }
 
-    // 2. Campus Road & Corridor Graph Edges
+    // 2. Optional Campus Graph Debug Layer
     if (showRoadNetworkLayer) {
       const uniqueEdges = graph.getUniqueUndirectedEdges();
       for (const edge of uniqueEdges) {
@@ -213,8 +257,8 @@ const GoogleMapImperativeOverlays: React.FC<{
         if (coords.length < 2) continue;
 
         let strokeColor = '#475569';
-        let strokeWeight = compact ? 3 : 4;
-        let strokeOpacity = 0.72;
+        let strokeWeight = compact ? 2.5 : 3.5;
+        let strokeOpacity = 0.65;
         let zIndex = 10;
 
         if (!edge.allowVehicle && edge.allowWalking) {
@@ -241,15 +285,15 @@ const GoogleMapImperativeOverlays: React.FC<{
 
         if (isSecondary && !isPrimary) {
           strokeColor = '#a855f7';
-          strokeWeight = 5.5;
-          strokeOpacity = 0.95;
+          strokeWeight = 5;
+          strokeOpacity = 0.9;
           zIndex = 30;
         }
 
         if (isPrimary) {
           strokeColor = emergencyMode ? '#ef4444' : '#06b6d4';
-          strokeWeight = 6.5;
-          strokeOpacity = 1.0;
+          strokeWeight = 6;
+          strokeOpacity = 0.95;
           zIndex = 40;
         }
 
@@ -280,16 +324,43 @@ const GoogleMapImperativeOverlays: React.FC<{
       }
     }
 
-    // 3. Active Real-Time Google Route Polyline (High-contrast casing + bright core)
-    if (routeGeometry && routeGeometry.length >= 2) {
+    // 2b. Secondary / Alternative Route Geometry (when comparing routes)
+    if (secondaryRouteGeometry && secondaryRouteGeometry.length >= 2) {
+      const altLiteral = secondaryRouteGeometry.map(([lat, lng]) => ({ lat, lng }));
+      const altCasing = new google.maps.Polyline({
+        path: altLiteral,
+        geodesic: true,
+        strokeColor: '#1e1b4b',
+        strokeOpacity: 0.75,
+        strokeWeight: 8,
+        zIndex: 32,
+        map,
+      });
+      const altMain = new google.maps.Polyline({
+        path: altLiteral,
+        geodesic: true,
+        strokeColor: '#a855f7',
+        strokeOpacity: 0.85,
+        strokeWeight: 5,
+        zIndex: 35,
+        map,
+      });
+      polylinesRef.current.push(altCasing, altMain);
+    }
+
+    // 3. Active Google Maps Route Polyline
+    const isLiveNavigating = remainingRouteGeometry && remainingRouteGeometry.length >= 2;
+
+    if (!isLiveNavigating && routeGeometry && routeGeometry.length >= 2) {
       const pathLiteral = routeGeometry.map(([lat, lng]) => ({ lat, lng }));
-      const routeColor = emergencyMode ? '#ef4444' : '#06b6d4';
+      const routeColor = emergencyMode ? '#ef4444' : '#1a73e8';
+      const innerHighlight = emergencyMode ? '#fca5a5' : '#38bdf8';
 
       const casingLine = new google.maps.Polyline({
         path: pathLiteral,
         geodesic: true,
         strokeColor: '#020617',
-        strokeOpacity: 0.85,
+        strokeOpacity: 0.9,
         strokeWeight: 10,
         zIndex: 50,
         map,
@@ -300,34 +371,76 @@ const GoogleMapImperativeOverlays: React.FC<{
         geodesic: true,
         strokeColor: routeColor,
         strokeOpacity: 1.0,
-        strokeWeight: 5.5,
+        strokeWeight: 6.5,
         zIndex: 55,
         map,
       });
 
-      polylinesRef.current.push(casingLine, mainLine);
+      const coreLine = new google.maps.Polyline({
+        path: pathLiteral,
+        geodesic: true,
+        strokeColor: innerHighlight,
+        strokeOpacity: 0.9,
+        strokeWeight: 2.5,
+        zIndex: 56,
+        map,
+      });
+
+      polylinesRef.current.push(casingLine, mainLine, coreLine);
     }
 
-    // 3b. Active Walking Navigation Remaining Route Highlight
-    if (remainingRouteGeometry && remainingRouteGeometry.length >= 2) {
+    // 3b. Active Live Navigation: Traveled Trail (Gray) + Remaining Route Ahead (Google Blue / Emerald)
+    if (isLiveNavigating) {
+      if (traveledRouteGeometry && traveledRouteGeometry.length >= 2) {
+        const travLiteral = traveledRouteGeometry.map(([lat, lng]) => ({ lat, lng }));
+        const travLine = new google.maps.Polyline({
+          path: travLiteral,
+          geodesic: true,
+          strokeColor: '#64748b',
+          strokeOpacity: 0.7,
+          strokeWeight: 5.5,
+          zIndex: 48,
+          map,
+        });
+        polylinesRef.current.push(travLine);
+      }
+
       const remLiteral = remainingRouteGeometry.map(([lat, lng]) => ({ lat, lng }));
-      const remLine = new google.maps.Polyline({
+      const remCasing = new google.maps.Polyline({
         path: remLiteral,
         geodesic: true,
-        strokeColor: '#10b981',
+        strokeColor: '#020617',
+        strokeOpacity: 0.92,
+        strokeWeight: 11,
+        zIndex: 58,
+        map,
+      });
+      const remMain = new google.maps.Polyline({
+        path: remLiteral,
+        geodesic: true,
+        strokeColor: emergencyMode ? '#ef4444' : '#1a73e8',
         strokeOpacity: 1.0,
         strokeWeight: 7,
         zIndex: 60,
         map,
       });
-      polylinesRef.current.push(remLine);
+      const remCore = new google.maps.Polyline({
+        path: remLiteral,
+        geodesic: true,
+        strokeColor: emergencyMode ? '#fecaca' : '#34d399',
+        strokeOpacity: 0.95,
+        strokeWeight: 3,
+        zIndex: 62,
+        map,
+      });
+      polylinesRef.current.push(remCasing, remMain, remCore);
     }
 
     // 4. Live GPS Accuracy Circle
     if (gpsState && gpsState.lat !== null && gpsState.lng !== null && gpsState.accuracyMeters) {
       const circle = new google.maps.Circle({
         center: { lat: gpsState.lat, lng: gpsState.lng },
-        radius: gpsState.accuracyMeters,
+        radius: Math.min(120, gpsState.accuracyMeters),
         strokeColor: '#3b82f6',
         strokeOpacity: 0.8,
         strokeWeight: 1.5,
@@ -353,7 +466,9 @@ const GoogleMapImperativeOverlays: React.FC<{
     gpsState,
     highlightedEdgePath,
     secondaryEdgePath,
+    secondaryRouteGeometry,
     routeGeometry,
+    traveledRouteGeometry,
     remainingRouteGeometry,
     activeCurrentEdge,
     emergencyMode,
@@ -380,6 +495,11 @@ const MapHeaderControls: React.FC<{
   routeGeometry: [number, number][];
   buildings: CampusBuildingEntry[];
   gpsState?: GpsPositionState;
+  liveNavMarker?: LiveMovingNavMarkerProps | null;
+  onSetCustomEndpoint?: (
+    point: CustomMapEndpoint,
+    role: 'ORIGIN' | 'DESTINATION' | 'LIVE_POSITION'
+  ) => void;
   onSnapBuildingToPlace?: (buildingId: string, place: GoogleLivePlaceResult) => void;
   onSelectPlaceMarker: (place: GoogleLivePlaceResult | null) => void;
   compact: boolean;
@@ -394,6 +514,8 @@ const MapHeaderControls: React.FC<{
   routeGeometry,
   buildings,
   gpsState,
+  liveNavMarker,
+  onSetCustomEndpoint,
   onSnapBuildingToPlace,
   onSelectPlaceMarker,
   compact,
@@ -420,7 +542,7 @@ const MapHeaderControls: React.FC<{
     if (routeGeometry.length >= 2) {
       const bounds = new google.maps.LatLngBounds();
       routeGeometry.forEach(([lat, lng]) => bounds.extend({ lat, lng }));
-      map.fitBounds(bounds, 48);
+      map.fitBounds(bounds, 56);
     } else {
       handleRecenterVFSTR();
     }
@@ -450,11 +572,11 @@ const MapHeaderControls: React.FC<{
         <div className="flex items-center gap-2">
           <Compass className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
           <span className="font-mono uppercase tracking-wider text-slate-200 font-semibold tabular-nums">
-            GOOGLE MAPS LIVE • VFSTR ({cursorCoords.lat.toFixed(5)}°N, {cursorCoords.lng.toFixed(5)}°E)
+            GOOGLE MAPS LIVE • ({cursorCoords.lat.toFixed(5)}°N, {cursorCoords.lng.toFixed(5)}°E)
           </span>
           <span className="hidden md:inline-block text-slate-600">•</span>
           <span className="hidden md:inline-flex items-center gap-1 text-emerald-400 font-mono text-[10px]">
-            <ShieldCheck className="w-3 h-3" /> Places API (New) + Routes API + Live Traffic
+            <ShieldCheck className="w-3 h-3" /> Live Routes API v2 + Places API (New)
           </span>
         </div>
 
@@ -471,7 +593,7 @@ const MapHeaderControls: React.FC<{
             title="Toggle Real-Time Google Maps Traffic Layer"
           >
             <Radio className="w-3 h-3 inline mr-1" />
-            GOOGLE TRAFFIC
+            TRAFFIC
           </button>
 
           <button
@@ -482,10 +604,10 @@ const MapHeaderControls: React.FC<{
                 ? 'bg-cyan-500/15 border-cyan-500/40 text-cyan-300'
                 : 'bg-slate-900 border-slate-800 text-slate-400'
             }`}
-            title="Toggle Campus Graph Corridors"
+            title="Toggle Campus Graph Corridors Overlay"
           >
             <Layers className="w-3 h-3 inline mr-1" />
-            CORRIDORS
+            GRAPH OVERLAY
           </button>
 
           <button
@@ -527,25 +649,30 @@ const MapHeaderControls: React.FC<{
             VFSTR
           </button>
 
-          {gpsState && gpsState.lat !== null && gpsState.lng !== null && (
+          {(liveNavMarker || (gpsState && gpsState.lat !== null && gpsState.lng !== null)) && (
             <button
               type="button"
               onClick={() => {
-                if (!map || gpsState.lat === null || gpsState.lng === null) return;
-                map.panTo({ lat: gpsState.lat, lng: gpsState.lng });
-                map.setZoom(18);
+                if (!map) return;
+                if (liveNavMarker) {
+                  map.panTo({ lat: liveNavMarker.lat, lng: liveNavMarker.lng });
+                  map.setZoom(18);
+                } else if (gpsState && gpsState.lat !== null && gpsState.lng !== null) {
+                  map.panTo({ lat: gpsState.lat, lng: gpsState.lng });
+                  map.setZoom(18);
+                }
               }}
               className="px-2 py-1 rounded text-[10px] font-mono bg-blue-500/20 border border-blue-500/40 text-blue-300 hover:bg-blue-500/30"
-              title="Recenter Map on Your Current GPS Position"
+              title="Recenter Map on Active Navigation / GPS Position"
             >
               <MapPin className="w-3 h-3 inline mr-1" />
-              MY GPS
+              MY POSITION
             </button>
           )}
         </div>
       </div>
 
-      {/* Live Google Places Search & Block Placement Bar */}
+      {/* Live Google Places Search & Direct Route Origin/Destination Setter */}
       {!compact && (
         <div className="relative px-3 py-1.5 bg-slate-900/90 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2">
           <form onSubmit={handleSearchGooglePlaces} className="flex items-center gap-1.5 flex-1 min-w-[240px]">
@@ -554,7 +681,7 @@ const MapHeaderControls: React.FC<{
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search live Google Places (e.g. 'U Block Vignan', 'NTR Vignan Library', 'Vignan Pharmacy')..."
+              placeholder="Search ANY place on Google Maps (e.g. 'NTR Vignan Library', 'Tenali Junction', 'Guntur')..."
               className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-cyan-500"
             />
             <button
@@ -562,7 +689,7 @@ const MapHeaderControls: React.FC<{
               disabled={isSearchingPlaces}
               className="px-2.5 py-1 rounded bg-cyan-600 hover:bg-cyan-500 text-white font-semibold text-[11px] shrink-0 transition-colors cursor-pointer"
             >
-              {isSearchingPlaces ? 'Querying...' : 'Google Search'}
+              {isSearchingPlaces ? 'Querying...' : 'Search Google Maps'}
             </button>
             {placeResults.length > 0 && (
               <button
@@ -576,9 +703,9 @@ const MapHeaderControls: React.FC<{
           </form>
 
           {showSearchDropdown && placeResults.length > 0 && (
-            <div className="w-full mt-1.5 p-2 rounded bg-slate-950 border border-slate-800 shadow-xl space-y-1.5 max-h-48 overflow-y-auto">
+            <div className="w-full mt-1.5 p-2 rounded bg-slate-950 border border-slate-800 shadow-xl space-y-1.5 max-h-52 overflow-y-auto">
               <div className="flex items-center justify-between text-[10px] text-slate-400 pb-1 border-b border-slate-800">
-                <span>LIVE GOOGLE PLACES API (NEW) RESULTS — CLICK TO VIEW OR SNAP BLOCK</span>
+                <span>LIVE GOOGLE PLACES API (NEW) — ROUTE DIRECTLY TO/FROM ANY PLACE</span>
                 {onSnapBuildingToPlace && (
                   <div className="flex items-center gap-1.5">
                     <span>Snap target:</span>
@@ -622,19 +749,46 @@ const MapHeaderControls: React.FC<{
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (map) {
-                          map.panTo({ lat: pl.lat, lng: pl.lng });
-                          map.setZoom(18);
-                        }
-                        onSelectPlaceMarker(pl);
-                      }}
-                      className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px]"
-                    >
-                      Locate
-                    </button>
+                    {onSetCustomEndpoint && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onSetCustomEndpoint(
+                              {
+                                lat: pl.lat,
+                                lng: pl.lng,
+                                label: pl.displayName,
+                                placeId: pl.placeId,
+                              },
+                              'ORIGIN'
+                            );
+                            setShowSearchDropdown(false);
+                          }}
+                          className="px-2 py-0.5 rounded bg-emerald-600/80 hover:bg-emerald-500 text-white text-[10px] font-semibold"
+                        >
+                          Set Origin
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onSetCustomEndpoint(
+                              {
+                                lat: pl.lat,
+                                lng: pl.lng,
+                                label: pl.displayName,
+                                placeId: pl.placeId,
+                              },
+                              'DESTINATION'
+                            );
+                            setShowSearchDropdown(false);
+                          }}
+                          className="px-2 py-0.5 rounded bg-rose-600/80 hover:bg-rose-500 text-white text-[10px] font-semibold"
+                        >
+                          Set Destination
+                        </button>
+                      </>
+                    )}
                     {onSnapBuildingToPlace && (
                       <button
                         type="button"
@@ -642,9 +796,9 @@ const MapHeaderControls: React.FC<{
                           onSnapBuildingToPlace(snapTargetBuildingId, pl);
                           setShowSearchDropdown(false);
                         }}
-                        className="px-2 py-0.5 rounded bg-emerald-600/80 hover:bg-emerald-500 text-white text-[10px] font-semibold"
+                        className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px]"
                       >
-                        Snap Block Here
+                        Snap Block
                       </button>
                     )}
                   </div>
@@ -666,20 +820,28 @@ export const CampusMapCanvas: React.FC<CampusMapCanvasProps> = ({
   gpsState,
   selectedSourceId,
   selectedTargetId,
+  customOriginPoint = null,
+  customDestinationPoint = null,
   highlightedNodePath = [],
   highlightedEdgePath = [],
   routeGeometry = [],
+  traveledRouteGeometry = [],
   remainingRouteGeometry = [],
+  liveNavMarker = null,
+  followCamera = false,
   secondaryEdgePath = [],
+  secondaryRouteGeometry = [],
   visitedNodes = [],
   frontierNodes = [],
   activeCurrentNode = null,
   activeCurrentEdge = null,
   emergencyMode = false,
+  defaultShowRoadNetworkLayer = false,
   onSelectNode,
   onSelectBuilding,
   onSelectEdge,
   onMapCoordinateClick,
+  onSetCustomEndpoint,
   onSnapBuildingToPlace,
   compact = false,
   showLegend = true,
@@ -687,7 +849,9 @@ export const CampusMapCanvas: React.FC<CampusMapCanvasProps> = ({
   recenterGpsTrigger = 0,
 }) => {
   const [mapTypeId, setMapTypeId] = useState<'hybrid' | 'roadmap' | 'satellite' | 'terrain'>('hybrid');
-  const [showRoadNetworkLayer, setShowRoadNetworkLayer] = useState<boolean>(true);
+  const [showRoadNetworkLayer, setShowRoadNetworkLayer] = useState<boolean>(
+    defaultShowRoadNetworkLayer
+  );
   const [showBuildingFootprints] = useState<boolean>(false);
   const [showGoogleTrafficLayer, setShowGoogleTrafficLayer] = useState<boolean>(true);
   const [cursorCoords, setCursorCoords] = useState<{ lat: number; lng: number }>({
@@ -735,6 +899,8 @@ export const CampusMapCanvas: React.FC<CampusMapCanvasProps> = ({
         routeGeometry={routeGeometry}
         buildings={buildings}
         gpsState={gpsState}
+        liveNavMarker={liveNavMarker}
+        onSetCustomEndpoint={onSetCustomEndpoint}
         onSnapBuildingToPlace={onSnapBuildingToPlace}
         onSelectPlaceMarker={setSearchedPlaceMarker}
         compact={compact}
@@ -762,8 +928,12 @@ export const CampusMapCanvas: React.FC<CampusMapCanvasProps> = ({
             gpsState={gpsState}
             highlightedEdgePath={highlightedEdgePath}
             secondaryEdgePath={secondaryEdgePath}
+            secondaryRouteGeometry={secondaryRouteGeometry}
             routeGeometry={routeGeometry}
+            traveledRouteGeometry={traveledRouteGeometry}
             remainingRouteGeometry={remainingRouteGeometry}
+            liveNavMarker={liveNavMarker}
+            followCamera={followCamera}
             activeCurrentEdge={activeCurrentEdge}
             emergencyMode={emergencyMode}
             showRoadNetworkLayer={showRoadNetworkLayer}
@@ -775,51 +945,51 @@ export const CampusMapCanvas: React.FC<CampusMapCanvasProps> = ({
             onSelectEdge={onSelectEdge}
           />
 
-          {/* Render DSA Algorithm Exploration Nodes when Visualizer or Path is Active */}
-          {graph.getAllNodes().map((node) => {
-            const isVisited = visitedSet.has(node.id);
-            const isFrontier = frontierSet.has(node.id);
-            const isCurrent = activeCurrentNode === node.id;
-            const isInPath = nodePathSet.has(node.id);
+          {/* Render DSA Algorithm Exploration Nodes ONLY when DSA Visualizer or Graph Overlay is Active */}
+          {(showRoadNetworkLayer || visitedNodes.length > 0 || frontierNodes.length > 0) &&
+            graph.getAllNodes().map((node) => {
+              const isVisited = visitedSet.has(node.id);
+              const isFrontier = frontierSet.has(node.id);
+              const isCurrent = activeCurrentNode === node.id;
+              const isInPath = nodePathSet.has(node.id);
 
-            // Skip nodes that already have a building marker unless DSA visualizer is actively highlighting them
-            if (node.buildingId && !isVisited && !isFrontier && !isCurrent) {
-              return null;
-            }
-            if (!isVisited && !isFrontier && !isCurrent && !isInPath) {
-              return null;
-            }
+              if (node.buildingId && !isVisited && !isFrontier && !isCurrent) {
+                return null;
+              }
+              if (!isVisited && !isFrontier && !isCurrent && !isInPath) {
+                return null;
+              }
 
-            const dotColor = isCurrent
-              ? '#22c55e'
-              : isFrontier
-              ? '#f59e0b'
-              : isVisited
-              ? '#38bdf8'
-              : '#06b6d4';
+              const dotColor = isCurrent
+                ? '#22c55e'
+                : isFrontier
+                ? '#f59e0b'
+                : isVisited
+                ? '#38bdf8'
+                : '#06b6d4';
 
-            return (
-              <AdvancedMarker
-                key={`node-${node.id}`}
-                position={{ lat: node.lat, lng: node.lng }}
-                title={`${node.name} (${node.lat.toFixed(5)}, ${node.lng.toFixed(5)})`}
-                onClick={() => {
-                  if (onSelectNode) onSelectNode(node.id);
-                }}
-              >
-                <div
-                  style={{
-                    width: isCurrent ? 16 : 11,
-                    height: isCurrent ? 16 : 11,
-                    borderRadius: '50%',
-                    background: dotColor,
-                    border: '2px solid #ffffff',
-                    boxShadow: '0 0 8px rgba(0,0,0,0.7)',
+              return (
+                <AdvancedMarker
+                  key={`node-${node.id}`}
+                  position={{ lat: node.lat, lng: node.lng }}
+                  title={`${node.name} (${node.lat.toFixed(5)}, ${node.lng.toFixed(5)})`}
+                  onClick={() => {
+                    if (onSelectNode) onSelectNode(node.id);
                   }}
-                />
-              </AdvancedMarker>
-            );
-          })}
+                >
+                  <div
+                    style={{
+                      width: isCurrent ? 16 : 11,
+                      height: isCurrent ? 16 : 11,
+                      borderRadius: '50%',
+                      background: dotColor,
+                      border: '2px solid #ffffff',
+                      boxShadow: '0 0 8px rgba(0,0,0,0.7)',
+                    }}
+                  />
+                </AdvancedMarker>
+              );
+            })}
 
           {/* Render VFSTR Campus Building AdvancedMarkers */}
           {buildings.map((b) => {
@@ -827,9 +997,11 @@ export const CampusMapCanvas: React.FC<CampusMapCanvasProps> = ({
               ? graph.getNode(b.nearestNodeId)
               : graph.findNearestNode(b.lat, b.lng);
             const isSource =
-              (nearestNode && nearestNode.id === selectedSourceId) || b.id === selectedSourceId;
+              !customOriginPoint &&
+              ((nearestNode && nearestNode.id === selectedSourceId) || b.id === selectedSourceId);
             const isTarget =
-              (nearestNode && nearestNode.id === selectedTargetId) || b.id === selectedTargetId;
+              !customDestinationPoint &&
+              ((nearestNode && nearestNode.id === selectedTargetId) || b.id === selectedTargetId);
 
             const borderCol = isSource
               ? '#10b981'
@@ -914,6 +1086,54 @@ export const CampusMapCanvas: React.FC<CampusMapCanvasProps> = ({
             );
           })}
 
+          {/* Render Custom Map-Clicked or Google-Place Origin Marker */}
+          {customOriginPoint && (
+            <AdvancedMarker
+              position={{ lat: customOriginPoint.lat, lng: customOriginPoint.lng }}
+              title={`Start: ${customOriginPoint.label}`}
+            >
+              <div className="flex flex-col items-center">
+                <div className="px-2.5 py-1 rounded-md bg-emerald-700 border-2 border-emerald-300 text-white font-bold text-[11px] shadow-xl flex items-center gap-1.5 whitespace-nowrap">
+                  <span className="w-2 h-2 rounded-full bg-emerald-300 animate-ping" />
+                  <span>START: {customOriginPoint.label}</span>
+                </div>
+                <div
+                  style={{
+                    width: 0,
+                    height: 0,
+                    borderLeft: '6px solid transparent',
+                    borderRight: '6px solid transparent',
+                    borderTop: '7px solid #6ee7b7',
+                  }}
+                />
+              </div>
+            </AdvancedMarker>
+          )}
+
+          {/* Render Custom Map-Clicked or Google-Place Destination Marker */}
+          {customDestinationPoint && (
+            <AdvancedMarker
+              position={{ lat: customDestinationPoint.lat, lng: customDestinationPoint.lng }}
+              title={`Destination: ${customDestinationPoint.label}`}
+            >
+              <div className="flex flex-col items-center">
+                <div className="px-2.5 py-1 rounded-md bg-rose-700 border-2 border-rose-300 text-white font-bold text-[11px] shadow-xl flex items-center gap-1.5 whitespace-nowrap">
+                  <span className="w-2 h-2 rounded-full bg-rose-300 animate-ping" />
+                  <span>DEST: {customDestinationPoint.label}</span>
+                </div>
+                <div
+                  style={{
+                    width: 0,
+                    height: 0,
+                    borderLeft: '6px solid transparent',
+                    borderRight: '6px solid transparent',
+                    borderTop: '7px solid #fda4af',
+                  }}
+                />
+              </div>
+            </AdvancedMarker>
+          )}
+
           {/* Render Active Incident Markers */}
           {incidents
             .filter(
@@ -951,11 +1171,58 @@ export const CampusMapCanvas: React.FC<CampusMapCanvasProps> = ({
               );
             })}
 
-          {/* Render Live GPS User Marker */}
+          {/* Render Real-Time Moving Google Maps Navigation Arrow Marker */}
+          {liveNavMarker && (
+            <AdvancedMarker
+              position={{ lat: liveNavMarker.lat, lng: liveNavMarker.lng }}
+              title={`Live Navigation (${liveNavMarker.lat.toFixed(6)}, ${liveNavMarker.lng.toFixed(6)})`}
+              zIndex={1000}
+            >
+              <div className="relative flex flex-col items-center pointer-events-none">
+                {/* Floating Live Speed & Progress Pill */}
+                <div className="mb-1.5 px-2 py-0.5 rounded-full bg-slate-950/95 border border-emerald-400/80 text-[10px] font-mono font-bold text-emerald-300 shadow-xl whitespace-nowrap">
+                  {(liveNavMarker.speedMps * 3.6).toFixed(1)} km/h • {liveNavMarker.progressPercent}%
+                </div>
+
+                {/* Google Maps Directional Navigation Puck with Rotating Heading Chevron */}
+                <div className="relative flex items-center justify-center w-11 h-11">
+                  <div className="absolute inset-0 rounded-full bg-blue-500/35 animate-ping" />
+                  <div
+                    style={{
+                      width: 36,
+                      height: 36,
+                      borderRadius: '50%',
+                      background: 'linear-gradient(135deg, #1d4ed8 0%, #0284c7 100%)',
+                      border: '3px solid #ffffff',
+                      boxShadow: '0 0 18px rgba(29,78,216,0.95)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      transform: `rotate(${liveNavMarker.headingDegrees}deg)`,
+                      transition: 'transform 120ms linear',
+                    }}
+                  >
+                    <svg
+                      width="18"
+                      height="18"
+                      viewBox="0 0 24 24"
+                      fill="#ffffff"
+                      xmlns="http://www.w3.org/2000/svg"
+                    >
+                      <path d="M12 2L4.5 20.29L5.21 21L12 18L18.79 21L19.5 20.29L12 2Z" />
+                    </svg>
+                  </div>
+                </div>
+              </div>
+            </AdvancedMarker>
+          )}
+
+          {/* Render Live Browser GPS Dot (when not superseded by the moving navigation chevron at the same spot) */}
           {gpsState && gpsState.lat !== null && gpsState.lng !== null && (
             <AdvancedMarker
               position={{ lat: gpsState.lat, lng: gpsState.lng }}
-              title={`Your Live GPS Position (${gpsState.lat.toFixed(6)}, ${gpsState.lng.toFixed(6)})`}
+              title={`Your Device GPS Position (${gpsState.lat.toFixed(6)}, ${gpsState.lng.toFixed(6)})`}
+              zIndex={950}
             >
               <div
                 style={{
@@ -986,7 +1253,7 @@ export const CampusMapCanvas: React.FC<CampusMapCanvasProps> = ({
                 position={{ lat: searchedPlaceMarker.lat, lng: searchedPlaceMarker.lng }}
                 onCloseClick={() => setSearchedPlaceMarker(null)}
               >
-                <div className="text-slate-900 text-xs max-w-[240px] space-y-1 p-1">
+                <div className="text-slate-900 text-xs max-w-[240px] space-y-1.5 p-1">
                   <div className="font-bold text-sm">{searchedPlaceMarker.displayName}</div>
                   <div className="text-slate-600 text-[11px]">
                     {searchedPlaceMarker.formattedAddress}
@@ -994,9 +1261,46 @@ export const CampusMapCanvas: React.FC<CampusMapCanvasProps> = ({
                   <div className="font-mono text-[10px] text-slate-500">
                     {searchedPlaceMarker.lat.toFixed(6)}°N, {searchedPlaceMarker.lng.toFixed(6)}°E
                   </div>
-                  <div className="text-[10px] text-slate-500">
-                    Google Place ID: <code>{searchedPlaceMarker.placeId}</code>
-                  </div>
+                  {onSetCustomEndpoint && (
+                    <div className="flex items-center gap-1.5 pt-1 border-t border-slate-200">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onSetCustomEndpoint(
+                            {
+                              lat: searchedPlaceMarker.lat,
+                              lng: searchedPlaceMarker.lng,
+                              label: searchedPlaceMarker.displayName,
+                              placeId: searchedPlaceMarker.placeId,
+                            },
+                            'ORIGIN'
+                          );
+                          setSearchedPlaceMarker(null);
+                        }}
+                        className="flex-1 px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-[10px] cursor-pointer"
+                      >
+                        Route From Here
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onSetCustomEndpoint(
+                            {
+                              lat: searchedPlaceMarker.lat,
+                              lng: searchedPlaceMarker.lng,
+                              label: searchedPlaceMarker.displayName,
+                              placeId: searchedPlaceMarker.placeId,
+                            },
+                            'DESTINATION'
+                          );
+                          setSearchedPlaceMarker(null);
+                        }}
+                        className="flex-1 px-2 py-1 rounded bg-rose-600 hover:bg-rose-700 text-white font-semibold text-[10px] cursor-pointer"
+                      >
+                        Route To Here
+                      </button>
+                    </div>
+                  )}
                 </div>
               </InfoWindow>
             </>
@@ -1032,17 +1336,6 @@ export const CampusMapCanvas: React.FC<CampusMapCanvasProps> = ({
                     {selectedBuildingInfo.googleUserRatingCount || 0} reviews)
                   </div>
                 )}
-                {selectedBuildingInfo.surveyNumber && (
-                  <div className="text-[10px] text-slate-500">
-                    Blueprint Ref: {selectedBuildingInfo.surveyNumber}
-                  </div>
-                )}
-                {selectedBuildingInfo.googleAttributions &&
-                  selectedBuildingInfo.googleAttributions.length > 0 && (
-                    <div className="text-[9px] text-slate-400">
-                      Attributions: {selectedBuildingInfo.googleAttributions.join(', ')}
-                    </div>
-                  )}
                 <div className="flex items-center gap-1.5 pt-1 border-t border-slate-200">
                   {onSelectBuilding && (
                     <>
@@ -1092,24 +1385,20 @@ export const CampusMapCanvas: React.FC<CampusMapCanvasProps> = ({
           <div className="absolute bottom-3 left-3 z-20 flex flex-wrap items-center gap-3 px-3 py-2 rounded-md bg-slate-950/90 border border-slate-800/90 backdrop-blur-md text-[11px] text-slate-300 pointer-events-none shadow-lg">
             <div className="flex items-center gap-1.5">
               <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block" />
-              <span>Origin Block</span>
+              <span>Origin</span>
             </div>
             <div className="flex items-center gap-1.5">
               <span className="w-2.5 h-2.5 rounded-full bg-rose-500 inline-block" />
-              <span>Destination Block</span>
+              <span>Destination</span>
             </div>
             <div className="flex items-center gap-1.5">
-              <span className="w-3.5 h-1 rounded bg-cyan-400 inline-block" />
-              <span>Google Route</span>
+              <span className="w-4 h-1.5 rounded bg-[#1a73e8] border border-sky-300 inline-block" />
+              <span>Live Google Route</span>
             </div>
-            <div className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-cyan-500 inline-block" />
-              <span>Google Places Verified</span>
-            </div>
-            {visitedNodes.length > 0 && (
+            {liveNavMarker && (
               <div className="flex items-center gap-1.5">
-                <span className="w-2.5 h-2.5 rounded-full bg-sky-500 inline-block" />
-                <span>DSA Explored ({visitedNodes.length})</span>
+                <span className="w-2.5 h-2.5 rounded-full bg-blue-500 border border-white inline-block" />
+                <span>Live Moving Navigator</span>
               </div>
             )}
           </div>

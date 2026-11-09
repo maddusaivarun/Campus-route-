@@ -7,6 +7,7 @@ import {
   RoutingProfile,
   CampusGraph,
 } from './graph/Graph';
+import { haversineDistanceMeters } from './graph/geodesic';
 import {
   BASELINE_VFSTR_OVERPASS_SNAPSHOT,
   CampusBuildingEntry,
@@ -31,6 +32,8 @@ import {
   discoverAndSyncVFSTRBlocksViaGooglePlaces,
   computeLiveGoogleRoutesBetweenLocations,
   syncGoogleRouteIntoCampusGraph,
+  convertGoogleRouteToExecutionResult,
+  densifyPolyline,
   GooglePlaceDiscoveryResult,
   GoogleComputedRouteResult,
 } from './services/googleMapsRealtimeService';
@@ -47,6 +50,7 @@ import {
   OffRouteEvaluationState,
   computeLiveNavigationProgress,
   evaluateOffRouteAndDebounce,
+  getPointAlongPolylineAtDistance,
 } from './services/liveTurnByTurnNavigator';
 import {
   AuthSessionState,
@@ -62,6 +66,7 @@ import {
 } from './services/firebaseService';
 import { Sidebar, NavigationTabId } from './components/Sidebar';
 import { TopNav } from './components/TopNav';
+import { CustomMapEndpoint, LiveMovingNavMarkerProps } from './components/CampusMapCanvas';
 import { OverviewView } from './views/OverviewView';
 import { LiveNavigationView } from './views/LiveNavigationView';
 import { TrafficControlView } from './views/TrafficControlView';
@@ -86,12 +91,13 @@ import { AnalyticsService } from './services/analyticsService';
 interface GoogleMapsRealtimeSyncBridgeProps {
   graph: CampusGraph;
   rawBuildings: CampusBuildingEntry[];
-  sourceBuilding: CampusBuildingEntry;
-  targetBuilding: CampusBuildingEntry;
+  originCoords: { lat: number; lng: number; label: string };
+  destinationCoords: { lat: number; lng: number; label: string };
   sourceId: string;
   targetId: string;
   routingProfile: RoutingProfile;
   emergencyMode: boolean;
+  walkingSpeedMps: number;
   syncTrigger: number;
   forceSyncRef: React.MutableRefObject<boolean>;
   onPlacesSynced: (updatedBuildings: CampusBuildingEntry[], syncedCount: number) => void;
@@ -102,12 +108,13 @@ interface GoogleMapsRealtimeSyncBridgeProps {
 const GoogleMapsRealtimeSyncBridge: React.FC<GoogleMapsRealtimeSyncBridgeProps> = ({
   graph,
   rawBuildings,
-  sourceBuilding,
-  targetBuilding,
+  originCoords,
+  destinationCoords,
   sourceId,
   targetId,
   routingProfile,
   emergencyMode,
+  walkingSpeedMps,
   syncTrigger,
   forceSyncRef,
   onPlacesSynced,
@@ -118,7 +125,7 @@ const GoogleMapsRealtimeSyncBridge: React.FC<GoogleMapsRealtimeSyncBridgeProps> 
   const routesLib = useMapsLibrary('routes');
   const hasInitialPlacesSyncedRef = useRef(false);
 
-  // 1. Live Google Places API (New) Discovery & Sync for all VFSTR Campus Blocks
+  // 1. Live Google Places API (New) Discovery & Sync for VFSTR Campus Blocks
   useEffect(() => {
     if (!placesLib) return;
     if (hasInitialPlacesSyncedRef.current && syncTrigger === 0) return;
@@ -143,26 +150,36 @@ const GoogleMapsRealtimeSyncBridge: React.FC<GoogleMapsRealtimeSyncBridgeProps> 
     };
   }, [placesLib, syncTrigger]);
 
-  // 2. Live Google Routes API (Route.computeRoutes) between selected Origin and Destination Blocks
+  // 2. Live Google Routes API (Route.computeRoutes) between selected Origin and Destination
   useEffect(() => {
-    if (!routesLib || !sourceBuilding || !targetBuilding || sourceId === targetId) return;
+    if (!routesLib) return;
+    const distBetweenEndpoints = haversineDistanceMeters(
+      originCoords.lat,
+      originCoords.lng,
+      destinationCoords.lat,
+      destinationCoords.lng
+    );
+    if (distBetweenEndpoints < 5) return;
 
     let cancelled = false;
     computeLiveGoogleRoutesBetweenLocations(
       routesLib,
       {
-        lat: sourceBuilding.lat,
-        lng: sourceBuilding.lng,
+        lat: originCoords.lat,
+        lng: originCoords.lng,
       },
       {
-        lat: targetBuilding.lat,
-        lng: targetBuilding.lng,
+        lat: destinationCoords.lat,
+        lng: destinationCoords.lng,
       },
       routingProfile,
-      emergencyMode
+      emergencyMode,
+      walkingSpeedMps
     ).then((routes) => {
-      if (cancelled || routes.length === 0) return;
-      syncGoogleRouteIntoCampusGraph(graph, sourceId, targetId, routes[0]);
+      if (cancelled) return;
+      if (routes.length > 0 && sourceId !== targetId) {
+        syncGoogleRouteIntoCampusGraph(graph, sourceId, targetId, routes[0]);
+      }
       onGoogleRoutesComputed(routes);
     });
 
@@ -172,16 +189,16 @@ const GoogleMapsRealtimeSyncBridge: React.FC<GoogleMapsRealtimeSyncBridgeProps> 
   }, [
     routesLib,
     graph,
-    sourceBuilding?.id,
-    sourceBuilding?.lat,
-    sourceBuilding?.lng,
-    targetBuilding?.id,
-    targetBuilding?.lat,
-    targetBuilding?.lng,
+    originCoords.lat,
+    originCoords.lng,
+    destinationCoords.lat,
+    destinationCoords.lng,
     sourceId,
     targetId,
     routingProfile,
     emergencyMode,
+    walkingSpeedMps,
+    syncTrigger,
   ]);
 
   return null;
@@ -242,6 +259,15 @@ export default function App() {
   const [googlePlacesSyncTrigger, setGooglePlacesSyncTrigger] = useState<number>(0);
   const forceGoogleSyncRef = useRef<boolean>(false);
   const [liveGoogleRoutes, setLiveGoogleRoutes] = useState<GoogleComputedRouteResult[]>([]);
+  const [useGoogleLiveRoutePrimary, setUseGoogleLiveRoutePrimary] = useState<boolean>(true);
+  const [selectedGoogleRouteIdx, setSelectedGoogleRouteIdx] = useState<number>(0);
+  const [userExplicitlyPickedGoogleRoute, setUserExplicitlyPickedGoogleRoute] =
+    useState<boolean>(false);
+
+  // Custom Map / Google Place Endpoints (for any arbitrary Google Map point or Place)
+  const [customOriginPoint, setCustomOriginPoint] = useState<CustomMapEndpoint | null>(null);
+  const [customDestinationPoint, setCustomDestinationPoint] =
+    useState<CustomMapEndpoint | null>(null);
 
   // Buildings, Custom Pathways, and Incidents State
   const [rawBuildings, setRawBuildings] = useState<CampusBuildingEntry[]>(() =>
@@ -256,7 +282,7 @@ export default function App() {
   // Walking Speed & Routing State
   const [walkingSpeedMps, setWalkingSpeedMps] = useState<number>(1.4);
 
-  // Optional Traffic Stress Testing State (OFF by default so real routing is never faked)
+  // Optional Traffic Stress Testing State (OFF by default)
   const [liveSimActive, setLiveSimActive] = useState<boolean>(false);
   const [liveSimIntervalMs, setLiveSimIntervalMs] = useState<number>(5000);
   const [liveSimIntensity, setLiveSimIntensity] = useState<SimulationIntensity>('NORMAL');
@@ -314,8 +340,13 @@ export default function App() {
   const [gpsState, setGpsState] = useState<GpsPositionState>(INITIAL_GPS_STATE);
   const gpsWatchIdRef = useRef<number | null>(null);
 
-  // Real-Time Walking Turn-by-Turn Navigation State
+  // Real-Time Turn-by-Turn Navigation Motion State (10Hz Google Maps Live Navigation Engine)
   const [liveNavStatus, setLiveNavStatus] = useState<LiveWalkNavigationStatus>('IDLE');
+  const [navTraveledMeters, setNavTraveledMeters] = useState<number>(0);
+  const [navSpeedMultiplier, setNavSpeedMultiplier] = useState<number>(1);
+  const [followCamera, setFollowCamera] = useState<boolean>(true);
+  const [voiceEnabled, setVoiceEnabled] = useState<boolean>(true);
+  const lastSpokenStepIdxRef = useRef<number>(-1);
   const offRouteEvalRef = useRef<OffRouteEvaluationState>(INITIAL_OFF_ROUTE_STATE);
   const [autoRerouteCount, setAutoRerouteCount] = useState<number>(0);
 
@@ -412,6 +443,7 @@ export default function App() {
 
   const handleGoogleRoutesComputed = useCallback((routes: GoogleComputedRouteResult[]) => {
     setLiveGoogleRoutes(routes);
+    setSelectedGoogleRouteIdx(0);
     setGraphVersion((v) => v + 1);
   }, []);
 
@@ -488,11 +520,38 @@ export default function App() {
     return () => clearInterval(timer);
   }, [liveSimActive, liveSimIntervalMs, handleStepLiveTraffic]);
 
-  // Compute Active Shortest-Path Route
-  const activeRoute = useMemo(() => {
+  const sourceBuilding =
+    buildings.find((b) => b.nearestNodeId === sourceId || b.id === sourceId) || buildings[0];
+  const targetBuilding =
+    buildings.find((b) => b.nearestNodeId === targetId || b.id === targetId) ||
+    buildings[8] ||
+    buildings[3];
+
+  const originCoords = useMemo(() => {
+    if (customOriginPoint) return customOriginPoint;
+    const node = graph.getNode(sourceId);
+    return {
+      lat: sourceBuilding?.lat ?? node?.lat ?? 16.23305,
+      lng: sourceBuilding?.lng ?? node?.lng ?? 80.55085,
+      label: sourceBuilding?.shortName ?? node?.name ?? 'Origin',
+    };
+  }, [customOriginPoint, sourceBuilding, graph, sourceId]);
+
+  const destinationCoords = useMemo(() => {
+    if (customDestinationPoint) return customDestinationPoint;
+    const node = graph.getNode(targetId);
+    return {
+      lat: targetBuilding?.lat ?? node?.lat ?? 16.23142,
+      lng: targetBuilding?.lng ?? node?.lng ?? 80.55235,
+      label: targetBuilding?.shortName ?? node?.name ?? 'Destination',
+    };
+  }, [customDestinationPoint, targetBuilding, graph, targetId]);
+
+  // Compute Campus Graph Shortest-Path Route
+  const campusGraphRoute = useMemo(() => {
     void graphVersion;
     void walkingSpeedMps;
-    return RoutingEngine.computeRoute(graph, {
+    const rawResult = RoutingEngine.computeRoute(graph, {
       sourceNodeId: sourceId,
       targetNodeId: targetId,
       algorithm,
@@ -501,6 +560,13 @@ export default function App() {
       emergencyMode,
       emergencyVehicle: emergencyMode ? emergencyVehicle : 'NONE',
     });
+    if (rawResult.found && rawResult.routeGeometry.length >= 2) {
+      return {
+        ...rawResult,
+        routeGeometry: densifyPolyline(rawResult.routeGeometry, 5),
+      };
+    }
+    return rawResult;
   }, [
     graph,
     sourceId,
@@ -515,42 +581,260 @@ export default function App() {
     liveGoogleRoutes,
   ]);
 
-  // Compute Live Turn-by-Turn Walking Navigation Telemetry
-  const liveNavTelemetry = useMemo(() => {
-    if (liveNavStatus === 'IDLE' || !activeRoute.found) return null;
-    if (gpsState.lat !== null && gpsState.lng !== null) {
-      return computeLiveNavigationProgress(
-        activeRoute,
+  // Compute Primary Active Route (combining Live Google Maps Route.computeRoutes + Verified Campus Graph)
+  const activeRoute = useMemo(() => {
+    const selectedGoogleRoute =
+      liveGoogleRoutes[selectedGoogleRouteIdx] || liveGoogleRoutes[0] || null;
+
+    // Always use Google Live Route when custom map/place endpoints are set or when Google Live Route is selected
+    const hasCustomEndpoint = Boolean(customOriginPoint || customDestinationPoint);
+    if (selectedGoogleRoute && (hasCustomEndpoint || useGoogleLiveRoutePrimary)) {
+      const googleExec = convertGoogleRouteToExecutionResult(
+        selectedGoogleRoute,
+        sourceId,
+        targetId,
+        originCoords.label,
+        destinationCoords.label,
+        routingProfile,
+        walkingSpeedMps
+      );
+
+      // If routing internally between two close VFSTR campus buildings (< 550m straight-line)
+      // and Google's public road route detours > 2.2x longer onto the outer highway while a direct
+      // verified internal campus footpath exists (and the user didn't explicitly click a Google route card
+      // or set a custom map point), prefer the verified internal campus road network path.
+      const straightLineMeters = haversineDistanceMeters(
+        originCoords.lat,
+        originCoords.lng,
+        destinationCoords.lat,
+        destinationCoords.lng
+      );
+      const isInternalShortWalk =
+        !hasCustomEndpoint &&
+        !userExplicitlyPickedGoogleRoute &&
+        straightLineMeters < 550 &&
+        campusGraphRoute.found &&
+        campusGraphRoute.totalDistanceMeters > 20 &&
+        selectedGoogleRoute.distanceMeters > campusGraphRoute.totalDistanceMeters * 2.2;
+
+      if (!isInternalShortWalk && googleExec.routeGeometry.length >= 2) {
+        return googleExec;
+      }
+    }
+
+    return campusGraphRoute;
+  }, [
+    liveGoogleRoutes,
+    selectedGoogleRouteIdx,
+    customOriginPoint,
+    customDestinationPoint,
+    useGoogleLiveRoutePrimary,
+    userExplicitlyPickedGoogleRoute,
+    sourceId,
+    targetId,
+    originCoords,
+    destinationCoords,
+    routingProfile,
+    walkingSpeedMps,
+    campusGraphRoute,
+  ]);
+
+  // Effective navigation speed in meters per second based on routing profile
+  const effectiveBaseSpeedMps = useMemo(() => {
+    if (emergencyMode) return 11.5;
+    if (routingProfile === 'VEHICLE') return 8.33; // ~30 km/h campus vehicle speed
+    if (routingProfile === 'BICYCLE') return 4.2; // ~15 km/h bicycle speed
+    return walkingSpeedMps;
+  }, [emergencyMode, routingProfile, walkingSpeedMps]);
+
+  // Reset traveled distance when origin/destination changes while not actively navigating
+  useEffect(() => {
+    if (liveNavStatus === 'IDLE') {
+      setNavTraveledMeters(0);
+      lastSpokenStepIdxRef.current = -1;
+    }
+  }, [
+    sourceId,
+    targetId,
+    customOriginPoint,
+    customDestinationPoint,
+    selectedGoogleRouteIdx,
+    useGoogleLiveRoutePrimary,
+    liveNavStatus,
+  ]);
+
+  // 10Hz Real-Time Navigation Motion Engine (smoothly moves marker along the active route polyline)
+  useEffect(() => {
+    if (liveNavStatus !== 'ACTIVE' || !activeRoute.found || activeRoute.routeGeometry.length < 2) {
+      return;
+    }
+
+    const tickIntervalMs = 100; // 10 updates per second for smooth 60fps-style interpolation
+    const timer = setInterval(() => {
+      setNavTraveledMeters((prevMeters) => {
+        const stepMeters =
+          effectiveBaseSpeedMps * navSpeedMultiplier * (tickIntervalMs / 1000);
+        const nextMeters = prevMeters + stepMeters;
+        const pointState = getPointAlongPolylineAtDistance(
+          activeRoute.routeGeometry,
+          nextMeters
+        );
+        if (pointState.hasReachedEnd) {
+          setLiveNavStatus('ARRIVED');
+          return pointState.totalMeters;
+        }
+        return nextMeters;
+      });
+    }, tickIntervalMs);
+
+    return () => clearInterval(timer);
+  }, [liveNavStatus, activeRoute, effectiveBaseSpeedMps, navSpeedMultiplier]);
+
+  // Compute current live navigation position & heading along the active route
+  const currentNavPointState = useMemo(() => {
+    if (!activeRoute.found || activeRoute.routeGeometry.length < 2) return null;
+
+    // If user has live physical GPS inside the VFSTR campus vicinity (< 1.5km from route start)
+    // and navTraveledMeters is still near 0, allow physical GPS coordinates to drive progress
+    if (
+      gpsState.isTracking &&
+      gpsState.lat !== null &&
+      gpsState.lng !== null &&
+      navTraveledMeters < 2
+    ) {
+      const distToOrigin = haversineDistanceMeters(
         gpsState.lat,
         gpsState.lng,
-        gpsState.accuracyMeters,
-        walkingSpeedMps,
-        liveNavStatus
+        activeRoute.routeGeometry[0][0],
+        activeRoute.routeGeometry[0][1]
       );
+      if (distToOrigin < 800) {
+        const gpsProgress = computeLiveNavigationProgress(
+          activeRoute,
+          gpsState.lat,
+          gpsState.lng,
+          gpsState.accuracyMeters,
+          effectiveBaseSpeedMps,
+          liveNavStatus
+        );
+        return {
+          lat: gpsProgress.snappedPosition[0],
+          lng: gpsProgress.snappedPosition[1],
+          headingDegrees: gpsProgress.headingDegrees,
+          traveledMeters: gpsProgress.traveledDistanceMeters,
+          totalMeters: gpsProgress.totalDistanceMeters,
+          hasReachedEnd: gpsProgress.remainingDistanceMeters <= 12,
+        };
+      }
     }
-    // If waiting for first GPS fix, show full planned route metrics from origin
-    const originPt = activeRoute.routeGeometry[0] || [16.23305, 80.55085];
+
+    return getPointAlongPolylineAtDistance(activeRoute.routeGeometry, navTraveledMeters);
+  }, [
+    activeRoute,
+    navTraveledMeters,
+    gpsState.isTracking,
+    gpsState.lat,
+    gpsState.lng,
+    gpsState.accuracyMeters,
+    effectiveBaseSpeedMps,
+    liveNavStatus,
+  ]);
+
+  // Compute Live Turn-by-Turn Walking Navigation Telemetry
+  const liveNavTelemetry = useMemo(() => {
+    if (!activeRoute.found || activeRoute.routeGeometry.length < 2) return null;
+    if (liveNavStatus === 'IDLE' && navTraveledMeters <= 0) return null;
+
+    const pt = currentNavPointState || {
+      lat: activeRoute.routeGeometry[0][0],
+      lng: activeRoute.routeGeometry[0][1],
+    };
+
     return computeLiveNavigationProgress(
       activeRoute,
-      originPt[0],
-      originPt[1],
-      15,
-      walkingSpeedMps,
+      pt.lat,
+      pt.lng,
+      gpsState.accuracyMeters ?? 5,
+      effectiveBaseSpeedMps,
       liveNavStatus
     );
   }, [
     liveNavStatus,
+    navTraveledMeters,
     activeRoute,
-    gpsState.lat,
-    gpsState.lng,
+    currentNavPointState,
     gpsState.accuracyMeters,
-    walkingSpeedMps,
+    effectiveBaseSpeedMps,
   ]);
 
-  // Continuous Off-Route Detection & Debounced Automatic Route Recalculation While Walking
+  // Build LiveMovingNavMarkerProps for the rotating 3D-style Google Maps Chevron Marker
+  const liveNavMarker: LiveMovingNavMarkerProps | null = useMemo(() => {
+    if (
+      (liveNavStatus === 'IDLE' && navTraveledMeters <= 0) ||
+      !currentNavPointState ||
+      !liveNavTelemetry
+    ) {
+      return null;
+    }
+    return {
+      lat: currentNavPointState.lat,
+      lng: currentNavPointState.lng,
+      headingDegrees: currentNavPointState.headingDegrees,
+      speedMps:
+        liveNavStatus === 'ACTIVE' ? effectiveBaseSpeedMps * navSpeedMultiplier : 0,
+      progressPercent: liveNavTelemetry.progressPercent,
+      nextInstruction: liveNavTelemetry.nextInstruction,
+    };
+  }, [
+    liveNavStatus,
+    navTraveledMeters,
+    currentNavPointState,
+    liveNavTelemetry,
+    effectiveBaseSpeedMps,
+    navSpeedMultiplier,
+  ]);
+
+  // Speak Turn-by-Turn Voice Guidance via Web Speech API when advancing steps
+  useEffect(() => {
+    if (
+      !voiceEnabled ||
+      liveNavStatus !== 'ACTIVE' ||
+      !liveNavTelemetry ||
+      typeof window === 'undefined' ||
+      !('speechSynthesis' in window)
+    ) {
+      return;
+    }
+
+    if (liveNavTelemetry.currentStepIndex !== lastSpokenStepIdxRef.current) {
+      lastSpokenStepIdxRef.current = liveNavTelemetry.currentStepIndex;
+      try {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(
+          liveNavTelemetry.nextInstruction
+        );
+        utterance.rate = 1.05;
+        utterance.pitch = 1.0;
+        window.speechSynthesis.speak(utterance);
+      } catch {
+        // ignore speech synthesis errors if browser blocks audio
+      }
+    }
+  }, [voiceEnabled, liveNavStatus, liveNavTelemetry]);
+
+  // Continuous Off-Route Detection & Debounced Automatic Route Recalculation While Walking with Physical GPS
   useEffect(() => {
     if (liveNavStatus !== 'ACTIVE' || !activeRoute.found) return;
     if (gpsState.lat === null || gpsState.lng === null) return;
+
+    // Only run physical GPS off-route detection if the user's physical GPS is actually within 2km of VFSTR campus
+    const distFromCampus = haversineDistanceMeters(
+      gpsState.lat,
+      gpsState.lng,
+      16.2325,
+      80.5509
+    );
+    if (distFromCampus > 2000) return;
 
     const decision = evaluateOffRouteAndDebounce(
       activeRoute,
@@ -563,20 +847,16 @@ export default function App() {
     offRouteEvalRef.current = decision.nextState;
 
     if (decision.shouldTriggerReroute) {
-      const snap = snapGpsToWalkableSegment(
-        graph,
-        gpsState.lat,
-        gpsState.lng,
-        gpsState.accuracyMeters,
-        routingProfile
+      setCustomOriginPoint({
+        lat: gpsState.lat,
+        lng: gpsState.lng,
+        label: 'Live GPS Reroute Position',
+      });
+      setNavTraveledMeters(0);
+      setAutoRerouteCount((c) => c + 1);
+      setDynamicRerouteBanner(
+        `Off-Route Detected (${decision.crossTrackDistanceMeters}m from planned path) — Automatically recalculated live Google Maps route from your current GPS coordinates.`
       );
-      if (snap && snap.snappedNodeId && snap.snappedNodeId !== sourceId) {
-        setSourceId(snap.snappedNodeId);
-        setAutoRerouteCount((c) => c + 1);
-        setDynamicRerouteBanner(
-          `Off-Route Detected (${decision.crossTrackDistanceMeters}m from planned path > ${decision.thresholdMeters}m threshold) — Automatically recalculated shortest route from ${snap.snappedRoadName || snap.snappedNodeId}.`
-        );
-      }
     }
   }, [
     liveNavStatus,
@@ -585,9 +865,6 @@ export default function App() {
     gpsState.lng,
     gpsState.accuracyMeters,
     gpsState.timestamp,
-    graph,
-    routingProfile,
-    sourceId,
   ]);
 
   // Detect Dynamic Rerouting when road conditions alter the optimal path
@@ -614,17 +891,15 @@ export default function App() {
   // Persist Route Calculation History
   useEffect(() => {
     if (!activeRoute.found || sourceId === targetId) return;
-    const srcBld = buildings.find((b) => b.nearestNodeId === sourceId);
-    const tgtBld = buildings.find((b) => b.nearestNodeId === targetId);
-    const srcName = srcBld?.shortName || graph.getNode(sourceId)?.name || sourceId;
-    const tgtName = tgtBld?.shortName || graph.getNode(targetId)?.name || targetId;
+    const srcName = originCoords.label;
+    const tgtName = destinationCoords.label;
 
     setRouteHistory((prev) => {
       const latest = prev[0];
       if (
         latest &&
-        latest.sourceId === sourceId &&
-        latest.targetId === targetId &&
+        latest.sourceName === srcName &&
+        latest.targetName === tgtName &&
         latest.algorithm === algorithm &&
         latest.routingProfile === routingProfile &&
         latest.timeSeconds === activeRoute.totalTimeSeconds
@@ -661,16 +936,16 @@ export default function App() {
     activeRoute,
     sourceId,
     targetId,
+    originCoords.label,
+    destinationCoords.label,
     algorithm,
     metric,
     routingProfile,
     emergencyMode,
     emergencyVehicle,
-    buildings,
-    graph,
   ]);
 
-  // Browser Geolocation Handlers (Continuous watchPosition with Walkable Segment Snapping)
+  // Browser Geolocation Handlers
   const handleStartGpsTracking = useCallback(() => {
     if (typeof navigator === 'undefined' || !('geolocation' in navigator)) {
       setGpsState({
@@ -692,6 +967,11 @@ export default function App() {
         const evaluated = evaluateGpsPosition(pos, true);
         setGpsState(evaluated);
         if (evaluated.lat !== null && evaluated.lng !== null) {
+          setCustomOriginPoint({
+            lat: evaluated.lat,
+            lng: evaluated.lng,
+            label: 'My Live GPS Position',
+          });
           const snapped = snapGpsToWalkableSegment(
             graph,
             evaluated.lat,
@@ -757,6 +1037,11 @@ export default function App() {
 
   const handleUseGpsAsOrigin = useCallback(() => {
     if (gpsState.lat !== null && gpsState.lng !== null) {
+      setCustomOriginPoint({
+        lat: gpsState.lat,
+        lng: gpsState.lng,
+        label: 'My Live GPS Position',
+      });
       const snapped = snapGpsToWalkableSegment(
         graph,
         gpsState.lat,
@@ -770,17 +1055,20 @@ export default function App() {
     }
   }, [gpsState.lat, gpsState.lng, gpsState.accuracyMeters, graph, routingProfile]);
 
-  // Real-Time Walking Navigation Session Controls
+  // Real-Time Turn-by-Turn Navigation Session Controls
   const handleStartLiveWalkNavigation = useCallback(() => {
     offRouteEvalRef.current = INITIAL_OFF_ROUTE_STATE;
-    setAutoRerouteCount(0);
+    lastSpokenStepIdxRef.current = -1;
+    setNavTraveledMeters(0);
     setLiveNavStatus('ACTIVE');
-    if (!gpsState.isTracking) {
-      handleStartGpsTracking();
-    } else if (gpsState.lat !== null && gpsState.lng !== null) {
-      handleUseGpsAsOrigin();
-    }
-  }, [gpsState.isTracking, gpsState.lat, gpsState.lng, handleStartGpsTracking, handleUseGpsAsOrigin]);
+  }, []);
+
+  const handleRestartLiveWalkNavigation = useCallback(() => {
+    offRouteEvalRef.current = INITIAL_OFF_ROUTE_STATE;
+    lastSpokenStepIdxRef.current = -1;
+    setNavTraveledMeters(0);
+    setLiveNavStatus('ACTIVE');
+  }, []);
 
   const handlePauseLiveWalkNavigation = useCallback(() => {
     setLiveNavStatus('PAUSED');
@@ -792,9 +1080,73 @@ export default function App() {
 
   const handleEndLiveWalkNavigation = useCallback(() => {
     setLiveNavStatus('IDLE');
+    setNavTraveledMeters(0);
+    lastSpokenStepIdxRef.current = -1;
     offRouteEvalRef.current = INITIAL_OFF_ROUTE_STATE;
-    handleStopGpsTracking();
-  }, [handleStopGpsTracking]);
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
+  const handleScrubNavigationProgress = useCallback(
+    (percent: number) => {
+      if (!activeRoute.found || activeRoute.routeGeometry.length < 2) return;
+      const clamped = Math.max(0, Math.min(100, percent));
+      const total = getPointAlongPolylineAtDistance(activeRoute.routeGeometry, 999999).totalMeters;
+      const targetDist = (clamped / 100) * total;
+      setNavTraveledMeters(targetDist);
+      if (liveNavStatus === 'IDLE') {
+        setLiveNavStatus('PAUSED');
+      } else if (clamped >= 99.5) {
+        setLiveNavStatus('ARRIVED');
+      } else if (liveNavStatus === 'ARRIVED') {
+        setLiveNavStatus('PAUSED');
+      }
+    },
+    [activeRoute, liveNavStatus]
+  );
+
+  // Handle setting custom Origin, Destination, or Live Reroute Position from Map Click or Google Places Search
+  const handleSetCustomEndpoint = useCallback(
+    (point: CustomMapEndpoint | null, role: 'ORIGIN' | 'DESTINATION' | 'LIVE_POSITION') => {
+      if (role === 'ORIGIN') {
+        setCustomOriginPoint(point);
+        if (point) {
+          const nearest = graph.findNearestNode(point.lat, point.lng);
+          if (nearest) setSourceId(nearest.id);
+        }
+        setNavTraveledMeters(0);
+      } else if (role === 'DESTINATION') {
+        setCustomDestinationPoint(point);
+        if (point) {
+          const nearest = graph.findNearestNode(point.lat, point.lng);
+          if (nearest) setTargetId(nearest.id);
+        }
+        setNavTraveledMeters(0);
+      } else if (role === 'LIVE_POSITION' && point) {
+        setCustomOriginPoint({
+          lat: point.lat,
+          lng: point.lng,
+          label: point.label || 'Live Reroute Position',
+        });
+        const nearest = graph.findNearestNode(point.lat, point.lng);
+        if (nearest) setSourceId(nearest.id);
+        setNavTraveledMeters(0);
+        setAutoRerouteCount((c) => c + 1);
+        setDynamicRerouteBanner(
+          `Live Off-Route Recalculation: Moved position to (${point.lat.toFixed(5)}, ${point.lng.toFixed(5)}) — Recomputed shortest real-time route to ${destinationCoords.label}.`
+        );
+        if (liveNavStatus === 'IDLE' || liveNavStatus === 'ARRIVED') {
+          setLiveNavStatus('ACTIVE');
+        }
+      }
+    },
+    [graph, destinationCoords.label, liveNavStatus]
+  );
 
   // Building Selection Handlers
   const handleSelectBuildingForRoute = (
@@ -806,23 +1158,53 @@ export default function App() {
       graph.findNearestNode(building.lat, building.lng)?.id ||
       sourceId;
     if (role === 'ORIGIN') {
+      setCustomOriginPoint(null);
       setSourceId(nodeId);
+      setNavTraveledMeters(0);
     } else if (role === 'DESTINATION') {
+      setCustomDestinationPoint(null);
       setTargetId(nodeId);
+      setNavTraveledMeters(0);
     } else {
       if (nodeId === sourceId) return;
+      setCustomDestinationPoint(null);
       setTargetId(nodeId);
+      setNavTraveledMeters(0);
     }
   };
 
   const handleSelectNodeFromMap = (nodeId: string, role: 'ORIGIN' | 'DESTINATION') => {
-    if (role === 'ORIGIN') setSourceId(nodeId);
-    else setTargetId(nodeId);
+    if (role === 'ORIGIN') {
+      setCustomOriginPoint(null);
+      setSourceId(nodeId);
+      setNavTraveledMeters(0);
+    } else {
+      setCustomDestinationPoint(null);
+      setTargetId(nodeId);
+      setNavTraveledMeters(0);
+    }
+  };
+
+  const handleChangeSourceDropdown = (nodeId: string) => {
+    setCustomOriginPoint(null);
+    setSourceId(nodeId);
+    setNavTraveledMeters(0);
+  };
+
+  const handleChangeTargetDropdown = (nodeId: string) => {
+    setCustomDestinationPoint(null);
+    setTargetId(nodeId);
+    setNavTraveledMeters(0);
   };
 
   const handleSwapNodes = () => {
+    const prevCustomOrigin = customOriginPoint;
+    const prevCustomDest = customDestinationPoint;
+    setCustomOriginPoint(prevCustomDest);
+    setCustomDestinationPoint(prevCustomOrigin);
     setSourceId(targetId);
     setTargetId(sourceId);
+    setNavTraveledMeters(0);
   };
 
   // Traffic & Incident Handlers
@@ -923,7 +1305,7 @@ export default function App() {
     StorageService.saveState({ dispatchLogs: updated });
   };
 
-  // Admin & Settings Handlers (Backed by Cloud Firestore when authenticated)
+  // Admin & Settings Handlers
   const handleVerifyOrUpdateBuilding = (updatedBuilding: CampusBuildingEntry) => {
     const updatedList = rawBuildings.map((b) =>
       b.id === updatedBuilding.id ? updatedBuilding : b
@@ -1112,9 +1494,10 @@ export default function App() {
     clearOverpassCache();
     try {
       localStorage.removeItem(BUILDING_DIR_STORAGE_KEY);
+      localStorage.removeItem('resqroute_vfstr_building_directory_gmp_v3');
       localStorage.removeItem('resqroute_vfstr_building_directory_v2');
-      sessionStorage.removeItem('resqroute_gmp_live_places_cache_v1');
-      sessionStorage.removeItem('resqroute_gmp_live_routes_cache_v1');
+      sessionStorage.removeItem('resqroute_gmp_live_places_cache_v4');
+      sessionStorage.removeItem('resqroute_gmp_live_routes_cache_v4');
     } catch {
       // ignore
     }
@@ -1129,6 +1512,9 @@ export default function App() {
     setDispatchLogs([]);
     setEmergencyMode(false);
     setLiveNavStatus('IDLE');
+    setNavTraveledMeters(0);
+    setCustomOriginPoint(null);
+    setCustomDestinationPoint(null);
     setWalkingSpeedMps(1.4);
     setAlgorithm(defaults.defaultAlgorithm);
     setMetric(defaults.defaultMetric);
@@ -1141,13 +1527,6 @@ export default function App() {
     void graphVersion;
     return AnalyticsService.getNetworkSummary(graph, buildings, incidents);
   }, [graph, buildings, incidents, graphVersion]);
-
-  const sourceBuilding =
-    buildings.find((b) => b.nearestNodeId === sourceId || b.id === sourceId) || buildings[0];
-  const targetBuilding =
-    buildings.find((b) => b.nearestNodeId === targetId || b.id === targetId) ||
-    buildings[8] ||
-    buildings[3];
 
   const activeIncidentsCount = incidents.filter(
     (i) => i.verificationStatus !== 'RESOLVED' && i.verificationStatus !== 'REJECTED'
@@ -1167,12 +1546,13 @@ export default function App() {
       <GoogleMapsRealtimeSyncBridge
         graph={graph}
         rawBuildings={rawBuildings}
-        sourceBuilding={sourceBuilding}
-        targetBuilding={targetBuilding}
+        originCoords={originCoords}
+        destinationCoords={destinationCoords}
         sourceId={sourceId}
         targetId={targetId}
         routingProfile={routingProfile}
         emergencyMode={emergencyMode}
+        walkingSpeedMps={walkingSpeedMps}
         syncTrigger={googlePlacesSyncTrigger}
         forceSyncRef={forceGoogleSyncRef}
         onPlacesSynced={handlePlacesSynced}
@@ -1281,6 +1661,9 @@ export default function App() {
                 onUseGpsAsOrigin={handleUseGpsAsOrigin}
                 sourceId={sourceId}
                 targetId={targetId}
+                customOriginPoint={customOriginPoint}
+                customDestinationPoint={customDestinationPoint}
+                onSetCustomEndpoint={handleSetCustomEndpoint}
                 algorithm={algorithm}
                 metric={metric}
                 routingProfile={routingProfile}
@@ -1291,23 +1674,49 @@ export default function App() {
                 emergencyMode={emergencyMode}
                 emergencyVehicle={emergencyVehicle}
                 activeRoute={activeRoute}
+                liveGoogleRoutes={liveGoogleRoutes}
+                useGoogleLiveRoutePrimary={useGoogleLiveRoutePrimary}
+                onToggleGoogleLiveRoutePrimary={(useGoogle) => {
+                  setUseGoogleLiveRoutePrimary(useGoogle);
+                  setUserExplicitlyPickedGoogleRoute(useGoogle);
+                }}
+                selectedGoogleRouteIdx={selectedGoogleRouteIdx}
+                onSelectGoogleRouteIdx={(idx) => {
+                  setSelectedGoogleRouteIdx(idx);
+                  setUseGoogleLiveRoutePrimary(true);
+                  setUserExplicitlyPickedGoogleRoute(true);
+                  setNavTraveledMeters(0);
+                }}
                 routeHistory={routeHistory}
                 liveNavStatus={liveNavStatus}
                 liveNavTelemetry={liveNavTelemetry}
+                liveNavMarker={liveNavMarker}
+                navSpeedMultiplier={navSpeedMultiplier}
+                onChangeNavSpeedMultiplier={setNavSpeedMultiplier}
+                followCamera={followCamera}
+                onToggleFollowCamera={() => setFollowCamera((f) => !f)}
+                voiceEnabled={voiceEnabled}
+                onToggleVoiceEnabled={() => setVoiceEnabled((v) => !v)}
+                onScrubNavigationProgress={handleScrubNavigationProgress}
                 autoRerouteCount={autoRerouteCount}
                 onStartLiveWalkNavigation={handleStartLiveWalkNavigation}
                 onPauseLiveWalkNavigation={handlePauseLiveWalkNavigation}
                 onResumeLiveWalkNavigation={handleResumeLiveWalkNavigation}
                 onEndLiveWalkNavigation={handleEndLiveWalkNavigation}
+                onRestartLiveWalkNavigation={handleRestartLiveWalkNavigation}
                 liveSimActive={liveSimActive}
                 liveTrafficEvents={liveTrafficEvents}
                 dynamicRerouteBanner={dynamicRerouteBanner}
                 onToggleLiveSim={() => setLiveSimActive((s) => !s)}
                 onStepLiveSim={handleStepLiveTraffic}
-                onChangeSource={setSourceId}
-                onChangeTarget={setTargetId}
+                onChangeSource={handleChangeSourceDropdown}
+                onChangeTarget={handleChangeTargetDropdown}
                 onSwapNodes={handleSwapNodes}
-                onChangeAlgorithm={setAlgorithm}
+                onChangeAlgorithm={(alg) => {
+                  setAlgorithm(alg);
+                  setUseGoogleLiveRoutePrimary(false);
+                  setUserExplicitlyPickedGoogleRoute(false);
+                }}
                 onChangeMetric={setMetric}
                 onChangeRoutingProfile={setRoutingProfile}
                 onSelectBuildingFromMap={handleSelectBuildingForRoute}
@@ -1349,8 +1758,8 @@ export default function App() {
                 emergencyMode={emergencyMode}
                 emergencyVehicle={emergencyVehicle}
                 dispatchLogs={dispatchLogs}
-                onChangeSource={setSourceId}
-                onChangeTarget={setTargetId}
+                onChangeSource={handleChangeSourceDropdown}
+                onChangeTarget={handleChangeTargetDropdown}
                 onToggleEmergencyMode={setEmergencyMode}
                 onChangeVehicle={setEmergencyVehicle}
                 onLogEmergencyDispatch={handleLogEmergencyDispatch}
@@ -1372,8 +1781,8 @@ export default function App() {
                 liveSimActive={liveSimActive}
                 onToggleLiveSim={() => setLiveSimActive((s) => !s)}
                 onStepLiveSim={handleStepLiveTraffic}
-                onChangeSource={setSourceId}
-                onChangeTarget={setTargetId}
+                onChangeSource={handleChangeSourceDropdown}
+                onChangeTarget={handleChangeTargetDropdown}
                 onChangeMetric={setMetric}
                 onChangeRoutingProfile={setRoutingProfile}
               />
@@ -1392,8 +1801,8 @@ export default function App() {
                 routingProfile={routingProfile}
                 emergencyMode={emergencyMode}
                 emergencyVehicle={emergencyVehicle}
-                onChangeSource={setSourceId}
-                onChangeTarget={setTargetId}
+                onChangeSource={handleChangeSourceDropdown}
+                onChangeTarget={handleChangeTargetDropdown}
                 onChangeAlgorithm={setAlgorithm}
                 onChangeRoutingProfile={setRoutingProfile}
               />

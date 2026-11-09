@@ -7,7 +7,11 @@ import {
 } from '../graph/Graph';
 import { CampusBuildingEntry, IncidentRecord } from '../data/campusData';
 import { ExtractedOSMBuilding } from '../graph/osmGraphExtractor';
-import { CampusMapCanvas } from '../components/CampusMapCanvas';
+import {
+  CampusMapCanvas,
+  CustomMapEndpoint,
+  LiveMovingNavMarkerProps,
+} from '../components/CampusMapCanvas';
 import { RoutingAlgorithmType } from '../services/routingEngine';
 import { AlgorithmExecutionResult } from '../algorithms/dijkstra';
 import { runYenKShortestPaths } from '../algorithms/yenKShortest';
@@ -21,7 +25,10 @@ import {
   TrafficEngine,
   LiveTrafficTickEvent,
 } from '../services/trafficEngine';
-import { GooglePlaceDiscoveryResult } from '../services/googleMapsRealtimeService';
+import {
+  GoogleComputedRouteResult,
+  GooglePlaceDiscoveryResult,
+} from '../services/googleMapsRealtimeService';
 import {
   Navigation,
   ArrowRightLeft,
@@ -45,7 +52,14 @@ import {
   Crosshair,
   Gauge,
   CornerUpRight,
+  Volume2,
+  VolumeX,
+  RotateCcw,
+  Eye,
+  MapPin,
 } from 'lucide-react';
+
+export type MapClickRole = 'DESTINATION' | 'ORIGIN' | 'LIVE_POSITION';
 
 interface LiveNavigationViewProps {
   graph: CampusGraph;
@@ -58,6 +72,12 @@ interface LiveNavigationViewProps {
   onUseGpsAsOrigin: () => void;
   sourceId: string;
   targetId: string;
+  customOriginPoint: CustomMapEndpoint | null;
+  customDestinationPoint: CustomMapEndpoint | null;
+  onSetCustomEndpoint: (
+    point: CustomMapEndpoint | null,
+    role: 'ORIGIN' | 'DESTINATION' | 'LIVE_POSITION'
+  ) => void;
   algorithm: RoutingAlgorithmType;
   metric: OptimizationMetric;
   routingProfile: RoutingProfile;
@@ -66,13 +86,27 @@ interface LiveNavigationViewProps {
   emergencyMode: boolean;
   emergencyVehicle: EmergencyVehicleType;
   activeRoute: AlgorithmExecutionResult;
+  liveGoogleRoutes: GoogleComputedRouteResult[];
+  useGoogleLiveRoutePrimary: boolean;
+  onToggleGoogleLiveRoutePrimary: (useGoogle: boolean) => void;
+  selectedGoogleRouteIdx: number;
+  onSelectGoogleRouteIdx: (idx: number) => void;
   routeHistory: RouteHistoryEntry[];
   liveNavStatus: LiveWalkNavigationStatus;
   liveNavTelemetry: LiveWalkNavigationTelemetry | null;
+  liveNavMarker: LiveMovingNavMarkerProps | null;
+  navSpeedMultiplier: number;
+  onChangeNavSpeedMultiplier: (mult: number) => void;
+  followCamera: boolean;
+  onToggleFollowCamera: () => void;
+  voiceEnabled: boolean;
+  onToggleVoiceEnabled: () => void;
+  onScrubNavigationProgress: (percent: number) => void;
   autoRerouteCount: number;
   onStartLiveWalkNavigation: () => void;
   onPauseLiveWalkNavigation: () => void;
   onResumeLiveWalkNavigation: () => void;
+  onRestartLiveWalkNavigation: () => void;
   onEndLiveWalkNavigation: () => void;
   liveSimActive: boolean;
   liveTrafficEvents: LiveTrafficTickEvent[];
@@ -101,6 +135,9 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
   onUseGpsAsOrigin,
   sourceId,
   targetId,
+  customOriginPoint,
+  customDestinationPoint,
+  onSetCustomEndpoint,
   algorithm,
   metric,
   routingProfile,
@@ -109,13 +146,27 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
   emergencyMode,
   emergencyVehicle,
   activeRoute,
+  liveGoogleRoutes,
+  useGoogleLiveRoutePrimary,
+  onToggleGoogleLiveRoutePrimary,
+  selectedGoogleRouteIdx,
+  onSelectGoogleRouteIdx,
   routeHistory,
   liveNavStatus,
   liveNavTelemetry,
+  liveNavMarker,
+  navSpeedMultiplier,
+  onChangeNavSpeedMultiplier,
+  followCamera,
+  onToggleFollowCamera,
+  voiceEnabled,
+  onToggleVoiceEnabled,
+  onScrubNavigationProgress,
   autoRerouteCount,
   onStartLiveWalkNavigation,
   onPauseLiveWalkNavigation,
   onResumeLiveWalkNavigation,
+  onRestartLiveWalkNavigation,
   onEndLiveWalkNavigation,
   liveSimActive,
   liveTrafficEvents,
@@ -129,11 +180,10 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
   onChangeMetric,
   onChangeRoutingProfile,
   onSelectBuildingFromMap,
-  onSelectNodeFromMap,
   onSnapBuildingToPlace,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
-  const [clickTargetRole, setClickTargetRole] = useState<'ORIGIN' | 'DESTINATION'>('DESTINATION');
+  const [clickTargetRole, setClickTargetRole] = useState<MapClickRole>('DESTINATION');
   const [fitRouteTrigger, setFitRouteTrigger] = useState(0);
   const [recenterGpsTrigger, setRecenterGpsTrigger] = useState(0);
   const [selectedAltIdx, setSelectedAltIdx] = useState<number>(0);
@@ -150,7 +200,12 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
   const sourceNode = graph.getNode(sourceId);
   const targetNode = graph.getNode(targetId);
 
-  // Compute K-Shortest Valid Alternative Routes
+  const originDisplayName =
+    customOriginPoint?.label || sourceBuilding?.shortName || sourceNode?.name || 'Origin';
+  const destinationDisplayName =
+    customDestinationPoint?.label || targetBuilding?.shortName || targetNode?.name || 'Destination';
+
+  // Compute K-Shortest Valid Alternative Routes on Campus Graph
   const alternativeRoutes = useMemo(() => {
     if (!sourceId || !targetId || sourceId === targetId) return [];
     return runYenKShortestPaths(
@@ -183,15 +238,24 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
   );
 
   const secondaryAltRoute = alternativeRoutes[selectedAltIdx > 0 ? selectedAltIdx : 1];
+  const secondaryGoogleRoute =
+    liveGoogleRoutes.length > 1
+      ? liveGoogleRoutes[selectedGoogleRouteIdx === 0 ? 1 : 0]
+      : null;
+
+  const handleMapCoordinateClick = (lat: number, lng: number) => {
+    const coordLabel = `Map Point (${lat.toFixed(5)}°N, ${lng.toFixed(5)}°E)`;
+    onSetCustomEndpoint({ lat, lng, label: coordLabel }, clickTargetRole);
+  };
 
   return (
     <div className="space-y-5">
-      {/* Live Walking Turn-by-Turn Navigation Command Banner */}
-      <div className="bg-[#111827] border border-cyan-500/40 rounded-lg p-4 shadow-lg">
+      {/* Live Turn-by-Turn Google Maps Navigation Command HUD */}
+      <div className="bg-[#111827] border border-cyan-500/40 rounded-lg p-4 shadow-lg space-y-3">
         <div className="flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-start gap-3 min-w-0">
+          <div className="flex items-start gap-3 min-w-0 flex-1">
             <div
-              className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 border ${
+              className={`w-11 h-11 rounded-lg flex items-center justify-center shrink-0 border ${
                 liveNavStatus === 'ACTIVE'
                   ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-300'
                   : liveNavStatus === 'OFF_ROUTE_WARNING' || liveNavStatus === 'REROUTING'
@@ -206,10 +270,10 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
               />
             </div>
 
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="text-sm font-bold text-white">
-                  Real-Time Walking Navigation
+                  Google Maps Real-Time Turn-by-Turn Navigation
                 </span>
                 <span
                   className={`px-2 py-0.5 rounded text-[10px] font-mono uppercase border ${
@@ -224,22 +288,29 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                       : 'bg-slate-900 border-slate-700 text-slate-400'
                   }`}
                 >
-                  STATUS: {liveNavStatus}
+                  {liveNavStatus === 'ACTIVE' ? 'LIVE MOVING' : liveNavStatus}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-blue-950/80 border border-blue-500/40 text-blue-300 text-[10px] font-mono">
+                  {originDisplayName} → {destinationDisplayName}
                 </span>
                 {autoRerouteCount > 0 && (
                   <span className="px-2 py-0.5 rounded bg-purple-950/80 border border-purple-500/40 text-purple-300 text-[10px] font-mono">
-                    Auto-Reroutes: {autoRerouteCount}
+                    Live Reroutes: {autoRerouteCount}
                   </span>
                 )}
               </div>
 
               {liveNavStatus !== 'IDLE' && liveNavTelemetry ? (
-                <div className="mt-1.5 space-y-1">
+                <div className="mt-1.5 space-y-1.5">
                   <div className="flex items-center gap-2 text-sm font-semibold text-cyan-300">
                     <CornerUpRight className="w-4 h-4 shrink-0 text-emerald-400" />
                     <span>{liveNavTelemetry.nextInstruction}</span>
                   </div>
                   <div className="flex flex-wrap items-center gap-3 text-xs font-mono text-slate-300">
+                    <span>
+                      Progress: <strong className="text-emerald-300">{liveNavTelemetry.progressPercent}%</strong> ({liveNavTelemetry.traveledDistanceMeters}m / {liveNavTelemetry.totalDistanceMeters}m)
+                    </span>
+                    <span>•</span>
                     <span>
                       Remaining: <strong className="text-white">{liveNavTelemetry.remainingDistanceMeters}m</strong>
                     </span>
@@ -253,46 +324,50 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                     </span>
                     <span>•</span>
                     <span>
-                      Path Deviation: <strong className={liveNavTelemetry.isOffRoute ? 'text-rose-400' : 'text-emerald-400'}>{liveNavTelemetry.crossTrackDistanceMeters}m</strong> (Threshold: {liveNavTelemetry.offRouteThresholdMeters}m)
+                      Heading: <strong className="text-sky-300">{Math.round(liveNavTelemetry.headingDegrees)}°</strong>
                     </span>
                   </div>
                 </div>
               ) : (
                 <p className="text-xs text-slate-400 mt-1">
-                  Press <strong className="text-emerald-300">START NAVIGATION</strong> to activate continuous browser GPS tracking (<code className="text-cyan-300">watchPosition</code>), live remaining route updates, next-turn distance, and automatic off-route recalculation.
+                  Press <strong className="text-emerald-300">START LIVE NAVIGATION</strong> to launch real-time turn-by-turn motion along the Google Maps route with rotating directional arrow, live camera follow, voice announcements, and instant off-route recalculation.
                 </p>
               )}
             </div>
           </div>
 
-          {/* Navigation Session Controls: Start, Pause, Resume, Recenter, End */}
+          {/* Navigation Session Controls: Start, Pause, Resume, Speed, Camera Follow, Voice, End */}
           <div className="flex flex-wrap items-center gap-2 shrink-0">
-            {liveNavStatus === 'IDLE' || liveNavStatus === 'ARRIVED' ? (
+            {liveNavStatus === 'IDLE' ? (
               <button
                 type="button"
                 disabled={!activeRoute.found}
                 onClick={onStartLiveWalkNavigation}
-                className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition-colors cursor-pointer"
+                className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg shadow-emerald-950/50"
               >
                 <Play className="w-4 h-4 fill-current" />
-                <span>START NAVIGATION</span>
+                <span>START LIVE NAVIGATION</span>
               </button>
             ) : (
               <>
-                {liveNavStatus === 'PAUSED' ? (
+                {liveNavStatus === 'PAUSED' || liveNavStatus === 'ARRIVED' ? (
                   <button
                     type="button"
-                    onClick={onResumeLiveWalkNavigation}
-                    className="px-3 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/50 text-emerald-300 font-semibold text-xs flex items-center gap-1.5"
+                    onClick={
+                      liveNavStatus === 'ARRIVED'
+                        ? onRestartLiveWalkNavigation
+                        : onResumeLiveWalkNavigation
+                    }
+                    className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 cursor-pointer"
                   >
-                    <Play className="w-3.5 h-3.5" />
-                    <span>Resume</span>
+                    <Play className="w-3.5 h-3.5 fill-current" />
+                    <span>{liveNavStatus === 'ARRIVED' ? 'Replay Route' : 'Resume'}</span>
                   </button>
                 ) : (
                   <button
                     type="button"
                     onClick={onPauseLiveWalkNavigation}
-                    className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 text-amber-300 font-semibold text-xs flex items-center gap-1.5"
+                    className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/50 text-amber-300 font-semibold text-xs flex items-center gap-1.5 cursor-pointer"
                   >
                     <Pause className="w-3.5 h-3.5" />
                     <span>Pause</span>
@@ -301,38 +376,125 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
 
                 <button
                   type="button"
+                  onClick={onRestartLiveWalkNavigation}
+                  className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-semibold text-xs flex items-center gap-1 cursor-pointer"
+                  title="Restart from Origin"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Restart</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={onToggleFollowCamera}
+                  className={`px-2.5 py-1.5 rounded-lg border font-semibold text-xs flex items-center gap-1 cursor-pointer ${
+                    followCamera
+                      ? 'bg-blue-500/20 border-blue-500/50 text-blue-300'
+                      : 'bg-slate-900 border-slate-800 text-slate-400'
+                  }`}
+                  title="Automatically pan Google Map camera to follow live navigation marker"
+                >
+                  <Eye className="w-3.5 h-3.5" />
+                  <span>{followCamera ? 'Follow: ON' : 'Follow: OFF'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={onToggleVoiceEnabled}
+                  className={`px-2.5 py-1.5 rounded-lg border font-semibold text-xs flex items-center gap-1 cursor-pointer ${
+                    voiceEnabled
+                      ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-300'
+                      : 'bg-slate-900 border-slate-800 text-slate-400'
+                  }`}
+                  title="Toggle spoken turn-by-turn voice instructions"
+                >
+                  {voiceEnabled ? (
+                    <Volume2 className="w-3.5 h-3.5" />
+                  ) : (
+                    <VolumeX className="w-3.5 h-3.5" />
+                  )}
+                  <span>{voiceEnabled ? 'Voice: ON' : 'Muted'}</span>
+                </button>
+
+                <button
+                  type="button"
                   onClick={() => setRecenterGpsTrigger((c) => c + 1)}
-                  disabled={gpsState.lat === null}
-                  className="px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 disabled:opacity-40 border border-cyan-500/50 text-cyan-300 font-semibold text-xs flex items-center gap-1.5"
+                  className="px-2.5 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/50 text-cyan-300 font-semibold text-xs flex items-center gap-1 cursor-pointer"
                 >
                   <Crosshair className="w-3.5 h-3.5" />
-                  <span>Recenter GPS</span>
+                  <span>Center</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={onEndLiveWalkNavigation}
-                  className="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/50 text-rose-300 font-semibold text-xs flex items-center gap-1.5"
+                  className="px-3 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/50 text-rose-300 font-semibold text-xs flex items-center gap-1.5 cursor-pointer"
                 >
                   <Square className="w-3.5 h-3.5" />
-                  <span>End Navigation</span>
+                  <span>Exit</span>
                 </button>
               </>
             )}
           </div>
         </div>
+
+        {/* Interactive Live Route Progress Scrubber & Speed Multiplier Bar */}
+        {liveNavStatus !== 'IDLE' && liveNavTelemetry && (
+          <div className="pt-2.5 border-t border-slate-800/90 flex flex-wrap items-center justify-between gap-4">
+            <div className="flex items-center gap-3 flex-1 min-w-[240px]">
+              <span className="text-[11px] font-mono text-slate-400 shrink-0">
+                LIVE SCRUBBER:
+              </span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={liveNavTelemetry.progressPercent}
+                onChange={(e) => onScrubNavigationProgress(Number(e.target.value))}
+                className="w-full accent-emerald-400 cursor-pointer"
+                title="Drag to move your live position along the Google Maps route"
+              />
+              <span className="text-xs font-mono font-bold text-emerald-300 w-10 text-right">
+                {liveNavTelemetry.progressPercent}%
+              </span>
+            </div>
+
+            <div className="flex items-center gap-1.5 text-xs">
+              <span className="text-[11px] font-mono text-slate-400 mr-1">MOTION SPEED:</span>
+              {[1, 2, 5, 10].map((mult) => (
+                <button
+                  key={mult}
+                  type="button"
+                  onClick={() => onChangeNavSpeedMultiplier(mult)}
+                  className={`px-2 py-0.5 rounded font-mono text-[11px] border cursor-pointer ${
+                    navSpeedMultiplier === mult
+                      ? 'bg-emerald-500/25 border-emerald-500/60 text-emerald-200 font-bold'
+                      : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {mult}x
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Live Dynamic Traffic & Rerouting Alert Bar */}
       {(dynamicRerouteBanner || liveTrafficEvents.length > 0) && (
         <div className="bg-[#111827] border border-slate-800/90 rounded-lg p-3 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2.5 min-w-0 text-xs">
-            <Radio className={`w-4 h-4 shrink-0 ${liveSimActive ? 'text-emerald-400 animate-pulse' : 'text-slate-400'}`} />
-            <span className="text-slate-300 truncate">
+            <Radio
+              className={`w-4 h-4 shrink-0 ${
+                liveSimActive ? 'text-emerald-400 animate-pulse' : 'text-cyan-400'
+              }`}
+            />
+            <span className="text-slate-200 truncate">
               {dynamicRerouteBanner ||
                 (liveTrafficEvents[0]
                   ? `Campus Corridor Update: ${liveTrafficEvents[0].summary}`
-                  : 'Monitoring VFSTR campus corridors.')}
+                  : 'Monitoring live Google Maps route & VFSTR corridors.')}
             </span>
           </div>
           <div className="flex items-center gap-2 shrink-0 text-xs">
@@ -367,24 +529,38 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <h2 className="text-sm font-semibold text-white flex items-center gap-2">
                 <Compass className="w-4 h-4 text-cyan-400" />
-                <span>VFSTR Campus Route Planner</span>
+                <span>Google Maps Route Planner</span>
               </h2>
-              <span className="text-[11px] font-mono text-cyan-400 uppercase">
-                {activeRoute.algorithmName.split(' ')[0]}
-              </span>
+              <button
+                type="button"
+                onClick={() => onToggleGoogleLiveRoutePrimary(!useGoogleLiveRoutePrimary)}
+                className={`px-2 py-0.5 rounded text-[10px] font-mono border cursor-pointer ${
+                  useGoogleLiveRoutePrimary
+                    ? 'bg-blue-500/20 border-blue-500/50 text-blue-300'
+                    : 'bg-cyan-500/15 border-cyan-500/40 text-cyan-300'
+                }`}
+                title="Switch between Live Google Maps Routes API v2 and Campus Footpath Graph DSA"
+              >
+                {useGoogleLiveRoutePrimary ? 'ENGINE: GOOGLE MAPS LIVE' : `ENGINE: ${algorithm}`}
+              </button>
             </div>
 
             {/* Travel Mode Selector: WALKING (Primary), BICYCLE, VEHICLE */}
             <div>
               <label className="block text-[11px] font-mono uppercase text-slate-400 mb-1.5">
-                Campus Travel Mode (Access Restrictions Enforced)
+                Travel Mode (Google Routes API + Campus Access)
               </label>
               <div className="grid grid-cols-3 gap-1.5">
                 {(
                   [
-                    { id: 'WALKING', label: 'Walking', speed: `${walkingSpeedMps.toFixed(1)} m/s`, icon: Footprints },
+                    {
+                      id: 'WALKING',
+                      label: 'Walking',
+                      speed: `${walkingSpeedMps.toFixed(1)} m/s`,
+                      icon: Footprints,
+                    },
                     { id: 'BICYCLE', label: 'Bicycle', speed: '4.2 m/s', icon: Bike },
-                    { id: 'VEHICLE', label: 'Vehicle', speed: 'Road Limit', icon: Car },
+                    { id: 'VEHICLE', label: 'Driving', speed: 'Live Traffic', icon: Car },
                   ] as const
                 ).map((mode) => {
                   const Icon = mode.icon;
@@ -394,7 +570,7 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                       key={mode.id}
                       type="button"
                       onClick={() => onChangeRoutingProfile(mode.id)}
-                      className={`py-2 px-2 rounded-md border text-xs font-medium flex flex-col items-center gap-1 transition-colors ${
+                      className={`py-2 px-2 rounded-md border text-xs font-medium flex flex-col items-center gap-1 transition-colors cursor-pointer ${
                         active
                           ? 'bg-cyan-500/15 border-cyan-500/50 text-cyan-300'
                           : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
@@ -430,20 +606,15 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                   onChange={(e) => onChangeWalkingSpeed(parseFloat(e.target.value))}
                   className="w-full accent-cyan-400 cursor-pointer"
                 />
-                <div className="flex justify-between text-[10px] font-mono text-slate-500">
-                  <span>0.8 m/s (Slow)</span>
-                  <span>1.4 m/s (Standard)</span>
-                  <span>2.4 m/s (Brisk)</span>
-                </div>
               </div>
             )}
 
-            {/* Real Browser Geolocation Bar with Explicit Explanation & Segment Snapping */}
+            {/* Real Browser Geolocation Bar with Direct Google Maps GPS Routing */}
             <div className="p-3 rounded-md bg-slate-950/90 border border-slate-800/90 space-y-2">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-mono uppercase text-slate-300 flex items-center gap-1.5 font-semibold">
                   <LocateFixed className="w-3.5 h-3.5 text-cyan-400" />
-                  Live Browser GPS Tracking
+                  Physical Device GPS
                 </span>
                 <div className="flex items-center gap-1.5">
                   {gpsState.lat !== null && (
@@ -451,9 +622,8 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                       type="button"
                       onClick={() => setRecenterGpsTrigger((c) => c + 1)}
                       className="px-2 py-0.5 rounded bg-blue-500/20 border border-blue-500/40 text-blue-300 text-[10px] font-mono"
-                      title="Recenter Map on Your GPS Position"
                     >
-                      Recenter
+                      Center GPS
                     </button>
                   )}
                   {gpsState.isTracking ? (
@@ -468,9 +638,9 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                     <button
                       type="button"
                       onClick={onStartGpsTracking}
-                      className="px-2.5 py-1 rounded bg-cyan-500/15 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/25 text-[11px] font-medium"
+                      className="px-2.5 py-1 rounded bg-cyan-500/15 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/25 text-[11px] font-medium cursor-pointer"
                     >
-                      Enable Live GPS
+                      Enable Device GPS
                     </button>
                   )}
                 </div>
@@ -478,14 +648,8 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
 
               <p className="text-[11px] text-slate-400 leading-snug">{gpsState.message}</p>
 
-              {gpsState.status === 'IDLE' && (
-                <p className="text-[10px] text-slate-500">
-                  Why permission is requested: Used strictly in your browser to snap your real-time walking location onto VFSTR footpaths and compute turn-by-turn progress.
-                </p>
-              )}
-
               {gpsState.lat !== null && gpsState.lng !== null && (
-                <div className="pt-1.5 border-t border-slate-800/80 space-y-1 text-[11px]">
+                <div className="pt-1.5 border-t border-slate-800/80 space-y-1.5 text-[11px]">
                   <div className="flex items-center justify-between font-mono text-slate-300">
                     <span>
                       {gpsState.lat.toFixed(5)}°N, {gpsState.lng.toFixed(5)}°E
@@ -494,20 +658,30 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                       ±{gpsState.accuracyMeters}m • {gpsState.lastUpdatedFormatted || 'Live'}
                     </span>
                   </div>
-                  {gpsSnapResult && (
-                    <div className="flex items-center justify-between text-[10px] font-mono text-slate-400">
-                      <span className="truncate">
-                        Snapped: {gpsSnapResult.snappedRoadName} ({gpsSnapResult.distanceToSegmentMeters}m)
-                      </span>
-                      <button
-                        type="button"
-                        onClick={onUseGpsAsOrigin}
-                        className="text-cyan-400 hover:text-cyan-300 font-semibold shrink-0 ml-2"
-                      >
-                        Use as Start →
-                      </button>
-                    </div>
-                  )}
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-mono text-slate-400 truncate">
+                      {gpsSnapResult
+                        ? `Snapped: ${gpsSnapResult.snappedRoadName}`
+                        : 'External GPS Coordinate Ready'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onSetCustomEndpoint(
+                          {
+                            lat: gpsState.lat!,
+                            lng: gpsState.lng!,
+                            label: 'My Live GPS Location',
+                          },
+                          'ORIGIN'
+                        );
+                        onUseGpsAsOrigin();
+                      }}
+                      className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30 text-[10px] font-semibold shrink-0 cursor-pointer"
+                    >
+                      Route From My GPS →
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -520,7 +694,7 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search verified VFSTR buildings (Library, U Block, Hostel)..."
+                  placeholder="Filter VFSTR blocks (Library, U Block, Hostel)..."
                   className="w-full bg-slate-900 border border-slate-800 rounded-md pl-8 pr-3 py-1.5 text-xs text-white focus:outline-none focus:border-cyan-500"
                 />
               </div>
@@ -528,7 +702,7 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                 <div className="mt-1.5 max-h-36 overflow-y-auto rounded border border-slate-800 bg-slate-950 divide-y divide-slate-800/70">
                   {filteredBuildings.length === 0 ? (
                     <div className="p-2.5 text-xs text-slate-500">
-                      No verified campus building matches &quot;{searchQuery}&quot;.
+                      No campus building matches &quot;{searchQuery}&quot;. Use the top Google Maps search bar to find any place!
                     </div>
                   ) : (
                     filteredBuildings.map((b) => (
@@ -541,6 +715,7 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                           <button
                             type="button"
                             onClick={() => {
+                              onSetCustomEndpoint(null, 'ORIGIN');
                               onSelectBuildingFromMap(b, 'ORIGIN');
                               setSearchQuery('');
                             }}
@@ -551,6 +726,7 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                           <button
                             type="button"
                             onClick={() => {
+                              onSetCustomEndpoint(null, 'DESTINATION');
                               onSelectBuildingFromMap(b, 'DESTINATION');
                               setSearchQuery('');
                             }}
@@ -569,47 +745,70 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
             {/* Origin & Destination Selectors */}
             <div className="space-y-3">
               <div>
-                <label className="block text-xs text-slate-400 mb-1">
-                  Starting Point (GPS / Campus Building / Intersection)
-                </label>
-                <select
-                  value={sourceBuilding?.id || sourceNode?.id || ''}
-                  onChange={(e) => {
-                    const found = buildings.find((b) => b.id === e.target.value);
-                    if (found) onSelectBuildingFromMap(found, 'ORIGIN');
-                    else onChangeSource(e.target.value);
-                  }}
-                  className="w-full bg-slate-900 border border-slate-700/80 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
-                >
-                  {buildings.map((b) => (
-                    <option key={b.id} value={b.id}>
-                      {b.officialName} ({b.shortName})
-                    </option>
-                  ))}
-                  {!sourceBuilding && sourceNode && (
-                    <option value={sourceNode.id}>
-                      Snapped Intersection: {sourceNode.name}
-                    </option>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs text-slate-400">
+                    Starting Point (Origin)
+                  </label>
+                  {customOriginPoint && (
+                    <button
+                      type="button"
+                      onClick={() => onSetCustomEndpoint(null, 'ORIGIN')}
+                      className="text-[10px] text-cyan-400 hover:underline"
+                    >
+                      Reset to Campus Block
+                    </button>
                   )}
-                </select>
+                </div>
+                {customOriginPoint ? (
+                  <div className="flex items-center justify-between bg-emerald-950/40 border border-emerald-500/50 rounded-lg px-3 py-2 text-xs text-emerald-200">
+                    <span className="truncate font-semibold flex items-center gap-1.5">
+                      <MapPin className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      {customOriginPoint.label}
+                    </span>
+                    <span className="font-mono text-[10px] text-emerald-400 ml-2 shrink-0">
+                      {customOriginPoint.lat.toFixed(4)}, {customOriginPoint.lng.toFixed(4)}
+                    </span>
+                  </div>
+                ) : (
+                  <select
+                    value={sourceBuilding?.id || sourceNode?.id || ''}
+                    onChange={(e) => {
+                      const found = buildings.find((b) => b.id === e.target.value);
+                      if (found) onSelectBuildingFromMap(found, 'ORIGIN');
+                      else onChangeSource(e.target.value);
+                    }}
+                    className="w-full bg-slate-900 border border-slate-700/80 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
+                  >
+                    {buildings.map((b) => (
+                      <option key={b.id} value={b.id}>
+                        {b.officialName} ({b.shortName})
+                      </option>
+                    ))}
+                    {!sourceBuilding && sourceNode && (
+                      <option value={sourceNode.id}>
+                        Intersection: {sourceNode.name}
+                      </option>
+                    )}
+                  </select>
+                )}
               </div>
 
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <div className="flex items-center gap-1 text-[11px] text-slate-400">
-                  <span>Map Click Sets:</span>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setClickTargetRole((r) => (r === 'ORIGIN' ? 'DESTINATION' : 'ORIGIN'))
-                    }
-                    className="px-2 py-0.5 rounded bg-slate-800 text-cyan-300 font-mono"
+                  <span>Map Click Mode:</span>
+                  <select
+                    value={clickTargetRole}
+                    onChange={(e) => setClickTargetRole(e.target.value as MapClickRole)}
+                    className="bg-slate-800 border border-slate-700 rounded px-2 py-0.5 text-cyan-300 font-mono text-[11px]"
                   >
-                    {clickTargetRole}
-                  </button>
+                    <option value="DESTINATION">Set Destination</option>
+                    <option value="ORIGIN">Set Origin</option>
+                    <option value="LIVE_POSITION">Move My Live Position (Reroute)</option>
+                  </select>
                 </div>
                 <button
                   onClick={onSwapNodes}
-                  className="flex items-center gap-1.5 px-3 py-1 rounded-md text-xs text-slate-300 hover:text-white bg-slate-800/80 hover:bg-slate-700 border border-slate-700 transition-colors"
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs text-slate-300 hover:text-white bg-slate-800/80 hover:bg-slate-700 border border-slate-700 transition-colors cursor-pointer"
                 >
                   <ArrowRightLeft className="w-3.5 h-3.5 text-cyan-400" />
                   <span>Swap</span>
@@ -617,71 +816,104 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
               </div>
 
               <div>
-                <label className="block text-xs text-slate-400 mb-1">
-                  Destination (Verified Campus Building / Intersection)
-                </label>
-                <select
-                  value={targetBuilding?.id || targetNode?.id || ''}
-                  onChange={(e) => {
-                    const found = buildings.find((b) => b.id === e.target.value);
-                    if (found) onSelectBuildingFromMap(found, 'DESTINATION');
-                    else onChangeTarget(e.target.value);
-                  }}
-                  className="w-full bg-slate-900 border border-slate-700/80 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
-                >
-                  {buildings.map((b) => (
-                    <option key={b.id} value={b.id}>
-                      {b.officialName} ({b.shortName})
-                    </option>
-                  ))}
-                  {!targetBuilding && targetNode && (
-                    <option value={targetNode.id}>
-                      Snapped Intersection: {targetNode.name}
-                    </option>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs text-slate-400">
+                    Destination
+                  </label>
+                  {customDestinationPoint && (
+                    <button
+                      type="button"
+                      onClick={() => onSetCustomEndpoint(null, 'DESTINATION')}
+                      className="text-[10px] text-cyan-400 hover:underline"
+                    >
+                      Reset to Campus Block
+                    </button>
                   )}
-                </select>
+                </div>
+                {customDestinationPoint ? (
+                  <div className="flex items-center justify-between bg-rose-950/40 border border-rose-500/50 rounded-lg px-3 py-2 text-xs text-rose-200">
+                    <span className="truncate font-semibold flex items-center gap-1.5">
+                      <MapPin className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                      {customDestinationPoint.label}
+                    </span>
+                    <span className="font-mono text-[10px] text-rose-400 ml-2 shrink-0">
+                      {customDestinationPoint.lat.toFixed(4)}, {customDestinationPoint.lng.toFixed(4)}
+                    </span>
+                  </div>
+                ) : (
+                  <select
+                    value={targetBuilding?.id || targetNode?.id || ''}
+                    onChange={(e) => {
+                      const found = buildings.find((b) => b.id === e.target.value);
+                      if (found) onSelectBuildingFromMap(found, 'DESTINATION');
+                      else onChangeTarget(e.target.value);
+                    }}
+                    className="w-full bg-slate-900 border border-slate-700/80 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-cyan-500"
+                  >
+                    {buildings.map((b) => (
+                      <option key={b.id} value={b.id}>
+                        {b.officialName} ({b.shortName})
+                      </option>
+                    ))}
+                    {!targetBuilding && targetNode && (
+                      <option value={targetNode.id}>
+                        Intersection: {targetNode.name}
+                      </option>
+                    )}
+                  </select>
+                )}
               </div>
             </div>
 
             {/* Algorithm & Metric Selectors */}
             <div className="grid grid-cols-2 gap-3 pt-2 border-t border-slate-800">
               <div>
-                <label className="block text-xs text-slate-400 mb-1">Routing Algorithm</label>
+                <label className="block text-xs text-slate-400 mb-1">Routing Engine</label>
                 <select
-                  value={algorithm}
-                  onChange={(e) => onChangeAlgorithm(e.target.value as RoutingAlgorithmType)}
+                  value={useGoogleLiveRoutePrimary ? 'GOOGLE_LIVE' : algorithm}
+                  onChange={(e) => {
+                    if (e.target.value === 'GOOGLE_LIVE') {
+                      onToggleGoogleLiveRoutePrimary(true);
+                    } else {
+                      onToggleGoogleLiveRoutePrimary(false);
+                      onChangeAlgorithm(e.target.value as RoutingAlgorithmType);
+                    }
+                  }}
                   className="w-full bg-slate-900 border border-slate-700/80 rounded-lg px-2.5 py-2 text-xs text-white focus:outline-none focus:border-cyan-500"
                 >
-                  <option value="DIJKSTRA">Dijkstra (Shortest Path)</option>
-                  <option value="ASTAR">A* Geodesic (Optimized)</option>
-                  <option value="BFS">BFS (Minimum Hops)</option>
-                  <option value="DFS">DFS (Traversal)</option>
+                  <option value="GOOGLE_LIVE">Google Maps Live (Routes API v2)</option>
+                  <option value="DIJKSTRA">Campus Graph: Dijkstra</option>
+                  <option value="ASTAR">Campus Graph: A* Search</option>
+                  <option value="BFS">Campus Graph: BFS</option>
+                  <option value="DFS">Campus Graph: DFS</option>
                 </select>
               </div>
 
               <div>
-                <label className="block text-xs text-slate-400 mb-1">Cost Metric</label>
+                <label className="block text-xs text-slate-400 mb-1">Optimization</label>
                 <select
                   value={metric}
                   onChange={(e) => onChangeMetric(e.target.value as OptimizationMetric)}
                   disabled={algorithm === 'BFS' || algorithm === 'DFS'}
                   className="w-full bg-slate-900 border border-slate-700/80 rounded-lg px-2.5 py-2 text-xs text-white focus:outline-none focus:border-cyan-500 disabled:opacity-50"
                 >
-                  <option value="DISTANCE">Shortest Distance (m)</option>
                   <option value="TIME">Fastest Time (sec)</option>
+                  <option value="DISTANCE">Shortest Distance (m)</option>
                 </select>
               </div>
             </div>
           </div>
 
-          {/* Route Telemetry, Alternative Routes & Turn-by-Turn Instructions */}
+          {/* Route Telemetry, Live Google Alternatives & Turn-by-Turn Instructions */}
           <div className="bg-[#111827] border border-slate-800/90 rounded-lg p-4 space-y-4">
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-white">Route Summary & Alternatives</h3>
+              <h3 className="text-sm font-semibold text-white">Live Route Summary</h3>
               {activeRoute.found ? (
                 <span className="flex items-center gap-1 text-xs text-emerald-400 font-medium">
                   <CheckCircle2 className="w-3.5 h-3.5" />
-                  Connected {activeRoute.routingProfile} Path
+                  {activeRoute.algorithmName.includes('Google')
+                    ? 'Google Maps Verified Path'
+                    : `Connected ${activeRoute.routingProfile} Path`}
                 </span>
               ) : (
                 <span className="flex items-center gap-1 text-xs text-rose-400 font-medium">
@@ -705,7 +937,7 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                     : 'Unreachable'}
                 </div>
                 <div className="text-[10px] font-mono text-slate-500">
-                  {activeRoute.totalTimeSeconds}s @ {walkingSpeedMps.toFixed(1)} m/s
+                  {activeRoute.totalTimeSeconds}s total duration
                 </div>
               </div>
 
@@ -718,40 +950,85 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                   {activeRoute.found ? `${activeRoute.totalDistanceMeters} m` : 'N/A'}
                 </div>
                 <div className="text-[10px] font-mono text-slate-500">
-                  {activeRoute.segmentSteps.length} connected segments
+                  {activeRoute.segmentSteps.length} turn-by-turn steps
                 </div>
               </div>
             </div>
 
-            {/* Alternative Routes List */}
-            {alternativeRoutes.length > 1 && (
+            {/* Live Google Maps Routes API Alternatives Selector */}
+            {liveGoogleRoutes.length > 0 && (
+              <div className="space-y-1.5 pt-2 border-t border-slate-800">
+                <div className="text-[11px] font-mono uppercase text-blue-400 flex items-center justify-between">
+                  <span>Live Google Maps Routes ({liveGoogleRoutes.length})</span>
+                  <span className="text-[10px] text-slate-500">Routes API v2</span>
+                </div>
+                {liveGoogleRoutes.map((gRoute, idx) => {
+                  const isSelected = useGoogleLiveRoutePrimary && selectedGoogleRouteIdx === idx;
+                  return (
+                    <div
+                      key={gRoute.id}
+                      onClick={() => {
+                        onToggleGoogleLiveRoutePrimary(true);
+                        onSelectGoogleRouteIdx(idx);
+                      }}
+                      className={`p-2 rounded border text-xs flex items-center justify-between cursor-pointer transition-colors ${
+                        isSelected
+                          ? 'bg-blue-950/40 border-blue-500/60 text-white'
+                          : 'bg-slate-900/60 border-slate-800 text-slate-300 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="truncate pr-2">
+                        <span className="font-mono text-[10px] text-blue-400 mr-1.5">
+                          G{idx + 1}
+                        </span>
+                        <span className="font-medium">{gRoute.label}</span>
+                      </div>
+                      <div className="font-mono text-[11px] shrink-0 text-right">
+                        <span className="text-emerald-400">{gRoute.distanceMeters}m</span>
+                        <span className="text-slate-500 mx-1">•</span>
+                        <span className="text-cyan-300">{gRoute.durationSeconds}s</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Campus Walkable Graph Alternatives */}
+            {!customOriginPoint && !customDestinationPoint && alternativeRoutes.length > 0 && (
               <div className="space-y-1.5 pt-2 border-t border-slate-800">
                 <div className="text-[11px] font-mono uppercase text-slate-400">
-                  Valid Alternative Campus Paths ({alternativeRoutes.length})
+                  VFSTR Internal Campus Paths ({alternativeRoutes.length})
                 </div>
-                {alternativeRoutes.map((alt, idx) => (
-                  <div
-                    key={alt.rank}
-                    onClick={() => setSelectedAltIdx(idx)}
-                    className={`p-2 rounded border text-xs flex items-center justify-between cursor-pointer transition-colors ${
-                      selectedAltIdx === idx
-                        ? 'bg-cyan-950/30 border-cyan-500/50 text-white'
-                        : 'bg-slate-900/60 border-slate-800 text-slate-300 hover:border-slate-700'
-                    }`}
-                  >
-                    <div className="truncate pr-2">
-                      <span className="font-mono text-[10px] text-cyan-400 mr-1.5">
-                        #{alt.rank}
-                      </span>
-                      <span className="font-medium">{alt.label}</span>
+                {alternativeRoutes.map((alt, idx) => {
+                  const isSelected = !useGoogleLiveRoutePrimary && selectedAltIdx === idx;
+                  return (
+                    <div
+                      key={alt.rank}
+                      onClick={() => {
+                        onToggleGoogleLiveRoutePrimary(false);
+                        setSelectedAltIdx(idx);
+                      }}
+                      className={`p-2 rounded border text-xs flex items-center justify-between cursor-pointer transition-colors ${
+                        isSelected
+                          ? 'bg-cyan-950/30 border-cyan-500/50 text-white'
+                          : 'bg-slate-900/60 border-slate-800 text-slate-300 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="truncate pr-2">
+                        <span className="font-mono text-[10px] text-cyan-400 mr-1.5">
+                          #{alt.rank}
+                        </span>
+                        <span className="font-medium">{alt.label}</span>
+                      </div>
+                      <div className="font-mono text-[11px] shrink-0 text-right">
+                        <span className="text-emerald-400">{alt.result.totalDistanceMeters}m</span>
+                        <span className="text-slate-500 mx-1">•</span>
+                        <span className="text-cyan-300">{alt.result.totalTimeSeconds}s</span>
+                      </div>
                     </div>
-                    <div className="font-mono text-[11px] shrink-0 text-right">
-                      <span className="text-emerald-400">{alt.result.totalDistanceMeters}m</span>
-                      <span className="text-slate-500 mx-1">•</span>
-                      <span className="text-cyan-300">{alt.result.totalTimeSeconds}s</span>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 
@@ -764,7 +1041,7 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                 <button
                   type="button"
                   onClick={() => setFitRouteTrigger((c) => c + 1)}
-                  className="text-[11px] text-cyan-400 hover:text-cyan-300 flex items-center gap-1"
+                  className="text-[11px] text-cyan-400 hover:text-cyan-300 flex items-center gap-1 cursor-pointer"
                 >
                   <Maximize2 className="w-3 h-3" /> Fit Route
                 </button>
@@ -772,22 +1049,28 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
 
               {activeRoute.segmentSteps.length === 0 ? (
                 <div className="p-4 rounded-lg bg-rose-950/25 border border-rose-500/40 text-xs text-rose-200">
-                  {sourceId === targetId
+                  {sourceId === targetId && !customOriginPoint && !customDestinationPoint
                     ? 'Starting point and destination are set to the same campus location.'
-                    : 'No connected walkable path exists between these locations (all connecting segments are closed or restricted).'}
+                    : 'No connected path exists between these locations (all connecting segments are closed or restricted).'}
                 </div>
               ) : (
                 <div className="space-y-2 max-h-[250px] overflow-y-auto pr-1">
                   {activeRoute.segmentSteps.map((seg, idx) => {
                     const isCurrentWalkStep =
                       liveNavStatus !== 'IDLE' && liveNavTelemetry?.currentStepIndex === idx;
+                    const isCompletedStep =
+                      liveNavStatus !== 'IDLE' &&
+                      liveNavTelemetry &&
+                      idx < liveNavTelemetry.currentStepIndex;
                     const isSlow = seg.status !== 'OPEN' || seg.congestionFactor > 1.25;
                     return (
                       <div
                         key={`${seg.stepIndex}-${seg.edgeId}`}
-                        className={`p-2.5 rounded-lg border text-xs flex items-start justify-between gap-2 ${
+                        className={`p-2.5 rounded-lg border text-xs flex items-start justify-between gap-2 transition-colors ${
                           isCurrentWalkStep
-                            ? 'bg-emerald-950/40 border-emerald-500/60'
+                            ? 'bg-emerald-950/50 border-emerald-500/70 shadow-md'
+                            : isCompletedStep
+                            ? 'bg-slate-950/50 border-slate-800/50 opacity-55'
                             : seg.status === 'ACCIDENT'
                             ? 'bg-rose-950/25 border-rose-500/40'
                             : isSlow
@@ -796,7 +1079,13 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                         }`}
                       >
                         <div className="flex items-start gap-2.5 min-w-0">
-                          <span className="w-5 h-5 rounded-full bg-cyan-500/20 border border-cyan-500/40 text-cyan-300 font-mono text-[11px] flex items-center justify-center shrink-0 mt-0.5">
+                          <span
+                            className={`w-5 h-5 rounded-full font-mono text-[11px] flex items-center justify-center shrink-0 mt-0.5 border ${
+                              isCurrentWalkStep
+                                ? 'bg-emerald-500 text-slate-950 border-emerald-300 font-bold'
+                                : 'bg-cyan-500/20 border-cyan-500/40 text-cyan-300'
+                            }`}
+                          >
                             {seg.stepIndex}
                           </span>
                           <div className="min-w-0">
@@ -822,19 +1111,22 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
 
         {/* Right Interactive Google Map & Live Corridor Matrix (8 cols) */}
         <div className="lg:col-span-8 flex flex-col gap-5">
-          <div className="bg-[#111827] border border-slate-800/90 rounded-lg overflow-hidden flex flex-col h-[540px]">
+          <div className="bg-[#111827] border border-slate-800/90 rounded-lg overflow-hidden flex flex-col h-[580px]">
             <div className="p-3.5 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2 text-xs">
               <div className="flex items-center gap-2 text-slate-300">
                 <Navigation className="w-4 h-4 text-cyan-400" />
                 <span>
-                  Click any VFSTR building marker or intersection to set{' '}
-                  <strong className="text-cyan-300">{clickTargetRole}</strong>
+                  Click anywhere on Google Maps to{' '}
+                  <strong className="text-cyan-300">
+                    {clickTargetRole === 'LIVE_POSITION'
+                      ? 'MOVE YOUR LIVE POSITION & REROUTE'
+                      : `SET ${clickTargetRole}`}
+                  </strong>
                 </span>
               </div>
               <div className="flex items-center gap-3 font-mono">
-                <span className="text-slate-400">
-                  {sourceBuilding?.shortName || sourceNode?.name} →{' '}
-                  {targetBuilding?.shortName || targetNode?.name}
+                <span className="text-slate-300 font-semibold">
+                  {originDisplayName} → {destinationDisplayName}
                 </span>
                 {impactedSegmentsOnRoute.length > 0 && (
                   <span className="text-amber-400 text-[11px]">
@@ -853,21 +1145,45 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                 gpsState={gpsState}
                 selectedSourceId={sourceId}
                 selectedTargetId={targetId}
+                customOriginPoint={customOriginPoint}
+                customDestinationPoint={customDestinationPoint}
                 highlightedNodePath={activeRoute.nodePath}
                 highlightedEdgePath={activeRoute.edgePath}
                 routeGeometry={activeRoute.routeGeometry}
+                traveledRouteGeometry={
+                  liveNavStatus !== 'IDLE' && liveNavTelemetry
+                    ? liveNavTelemetry.traveledGeometry
+                    : []
+                }
                 remainingRouteGeometry={
                   liveNavStatus !== 'IDLE' && liveNavTelemetry
                     ? liveNavTelemetry.remainingGeometry
                     : []
                 }
+                liveNavMarker={liveNavMarker}
+                followCamera={liveNavStatus === 'ACTIVE' && followCamera}
                 secondaryEdgePath={secondaryAltRoute ? secondaryAltRoute.result.edgePath : []}
-                visitedNodes={activeRoute.visitedOrder}
+                secondaryRouteGeometry={
+                  useGoogleLiveRoutePrimary && secondaryGoogleRoute
+                    ? secondaryGoogleRoute.path
+                    : secondaryAltRoute
+                    ? secondaryAltRoute.result.routeGeometry
+                    : []
+                }
+                visitedNodes={[]}
+                defaultShowRoadNetworkLayer={false}
                 emergencyMode={emergencyMode}
                 fitRouteTrigger={fitRouteTrigger}
                 recenterGpsTrigger={recenterGpsTrigger}
-                onSelectBuilding={(b) => onSelectBuildingFromMap(b, clickTargetRole)}
-                onSelectNode={(nodeId) => onSelectNodeFromMap(nodeId, clickTargetRole)}
+                onSelectBuilding={(b, explicitRole) => {
+                  const role =
+                    explicitRole ||
+                    (clickTargetRole === 'ORIGIN' ? 'ORIGIN' : 'DESTINATION');
+                  onSetCustomEndpoint(null, role);
+                  onSelectBuildingFromMap(b, role);
+                }}
+                onMapCoordinateClick={handleMapCoordinateClick}
+                onSetCustomEndpoint={onSetCustomEndpoint}
                 onSnapBuildingToPlace={onSnapBuildingToPlace}
               />
             </div>
@@ -934,11 +1250,11 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
           {/* Recent Route Calculations Log */}
           <div className="bg-[#111827] border border-slate-800/90 rounded-lg p-4">
             <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">
-              Recent Campus Route Queries
+              Recent Campus & Google Maps Route Queries
             </h3>
             {routeHistory.length === 0 ? (
               <p className="text-xs text-slate-500">
-                Select different campus origins or destinations to log route computations.
+                Select different origins or destinations to log route computations.
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -946,27 +1262,27 @@ export const LiveNavigationView: React.FC<LiveNavigationViewProps> = ({
                   <thead>
                     <tr className="border-b border-slate-800 text-slate-400 font-mono text-[11px]">
                       <th className="py-2 pr-3">Time</th>
-                      <th className="py-2 px-3">Corridor</th>
+                      <th className="py-2 px-3">Route</th>
                       <th className="py-2 px-3">Mode</th>
-                      <th className="py-2 px-3">Algorithm</th>
+                      <th className="py-2 px-3">Engine</th>
                       <th className="py-2 px-3 text-right">Distance</th>
                       <th className="py-2 pl-3 text-right">ETA</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60">
-                    {routeHistory.slice(0, 5).map((entry) => (
-                      <tr key={entry.id} className="hover:bg-slate-900/50">
-                        <td className="py-2 pr-3 font-mono text-slate-400">{entry.timestamp}</td>
+                    {routeHistory.slice(0, 6).map((h) => (
+                      <tr key={h.id} className="hover:bg-slate-900/40">
+                        <td className="py-2 pr-3 font-mono text-slate-400">{h.timestamp}</td>
                         <td className="py-2 px-3 text-white font-medium">
-                          {entry.sourceName} → {entry.targetName}
+                          {h.sourceName} → {h.targetName}
                         </td>
-                        <td className="py-2 px-3 font-mono text-slate-300">{entry.routingProfile}</td>
-                        <td className="py-2 px-3 font-mono text-cyan-400">{entry.algorithm}</td>
-                        <td className="py-2 px-3 font-mono text-right tabular-nums text-slate-300">
-                          {entry.distanceMeters} m
+                        <td className="py-2 px-3 font-mono text-cyan-300">{h.routingProfile}</td>
+                        <td className="py-2 px-3 font-mono text-slate-300">{h.algorithm}</td>
+                        <td className="py-2 px-3 font-mono text-emerald-400 text-right">
+                          {h.distanceMeters}m
                         </td>
-                        <td className="py-2 pl-3 font-mono text-right tabular-nums text-emerald-400">
-                          {entry.timeSeconds}s
+                        <td className="py-2 pl-3 font-mono text-white text-right">
+                          {h.timeSeconds}s
                         </td>
                       </tr>
                     ))}

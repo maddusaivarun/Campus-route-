@@ -6,12 +6,10 @@ import { CampusGraph } from '../graph/Graph';
 import { ExtractedOSMBuilding } from '../graph/osmGraphExtractor';
 import { haversineDistanceMeters } from '../graph/geodesic';
 
-export const BUILDING_DIR_STORAGE_KEY = 'resqroute_vfstr_building_directory_gmp_v3';
+export const BUILDING_DIR_STORAGE_KEY = 'resqroute_vfstr_building_directory_gmp_v4';
 
 /**
- * Deterministic mapping from VFSTR Campus Building IDs to primary graph anchor node IDs.
- * When live Google Maps Places API (New) updates a building's coordinates, its anchor node
- * and all incident road edges are automatically updated in place.
+ * Deterministic mapping from VFSTR Campus Building IDs to primary road-aligned graph anchor node IDs.
  */
 export const BUILDING_TO_ANCHOR_NODE_ID: Record<string, string> = {
   BLD_A_BLOCK: 'OSM_N_1002',
@@ -57,8 +55,9 @@ export function savePersistedBuildingDirectory(
 }
 
 /**
- * Reconciles the VFSTR Campus Building Directory with live Google Places coordinates,
- * OpenStreetMap building footprints, and synchronizes each building's anchor node on the CampusGraph.
+ * Reconciles the VFSTR Campus Building Directory with OpenStreetMap building footprints
+ * and binds each building to its nearest road-aligned graph anchor node WITHOUT distorting
+ * the underlying road intersection geometry.
  */
 export function reconcileBuildingsWithOSM(
   buildings: CampusBuildingEntry[],
@@ -93,16 +92,26 @@ export function reconcileBuildingsWithOSM(
     let nearestNode = mappedAnchorId ? graph.getNode(mappedAnchorId) : undefined;
 
     if (nearestNode) {
-      // Snap the graph anchor node directly to the building's live Google Maps Place coordinate
-      graph.updateNodeCoordinates(
-        nearestNode.id,
-        b.lat,
-        b.lng,
-        b.dataSource === 'GOOGLE_MAPS_PLACES' ? 'GOOGLE_MAPS' : 'ADMIN_VERIFIED'
-      );
       nearestNode.buildingId = b.id;
       nearestNode.name = b.officialName;
       nearestNode.shortLabel = b.shortName;
+      // Only move the anchor node if the building was moved within 60m (e.g. entrance adjustment),
+      // preventing cross-campus diagonal road distortions.
+      const distFromAnchor = haversineDistanceMeters(
+        b.lat,
+        b.lng,
+        nearestNode.lat,
+        nearestNode.lng
+      );
+      if (distFromAnchor > 2 && distFromAnchor <= 35) {
+        const entrancePt = b.entrances?.[0] || { lat: b.lat, lng: b.lng };
+        graph.updateNodeCoordinates(
+          nearestNode.id,
+          entrancePt.lat,
+          entrancePt.lng,
+          b.dataSource === 'GOOGLE_MAPS_PLACES' ? 'GOOGLE_MAPS' : 'ADMIN_VERIFIED'
+        );
+      }
     } else {
       const primaryEntrance = b.entrances?.[0] || { lat: b.lat, lng: b.lng };
       nearestNode =

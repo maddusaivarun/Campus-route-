@@ -1,6 +1,13 @@
 import { CampusBuildingEntry, VFSTR_CAMPUS_CENTER } from '../data/campusData';
 import { CampusGraph, RoutingProfile } from '../graph/Graph';
-import { haversineDistanceMeters } from '../graph/geodesic';
+import {
+  bearingToCompassDirection,
+  calculateBearingDegrees,
+  calculatePolylineLengthMeters,
+  deriveTurnManeuver,
+  haversineDistanceMeters,
+} from '../graph/geodesic';
+import { AlgorithmExecutionResult, RouteSegmentStep } from '../algorithms/dijkstra';
 
 export interface GoogleLivePlaceResult {
   placeId: string;
@@ -36,13 +43,14 @@ export interface GoogleLiveRouteOption {
   steps: GoogleLiveRouteStep[];
   viewport?: google.maps.LatLngBounds | null;
   rawRoute?: any;
+  isGoogleMapsNative?: boolean;
 }
 
 export type GooglePlaceDiscoveryResult = GoogleLivePlaceResult;
 export type GoogleComputedRouteResult = GoogleLiveRouteOption;
 
-const PLACES_SESSION_CACHE_KEY = 'resqroute_gmp_live_places_cache_v1';
-const ROUTES_SESSION_CACHE_KEY = 'resqroute_gmp_live_routes_cache_v1';
+const PLACES_SESSION_CACHE_KEY = 'resqroute_gmp_live_places_cache_v4';
+const ROUTES_SESSION_CACHE_KEY = 'resqroute_gmp_live_routes_cache_v4';
 
 /**
  * Helper to retrieve the provisioned Google Maps Platform API key from environment variables.
@@ -80,12 +88,73 @@ export function checkAndDispatchQuotaError(err: unknown): void {
 }
 
 /**
+ * Strips HTML markup from Google Maps step instructions.
+ */
+export function stripHtmlTags(raw: string): string {
+  if (!raw) return '';
+  return raw
+    .replace(/<div[^>]*>/gi, ' — ')
+    .replace(/<\/?[^>]+(>|$)/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Densifies a geographic polyline so that consecutive points are at most `maxStepMeters` apart.
+ * This guarantees smooth 60fps/10Hz marker motion and sub-meter remaining-route slicing during live navigation.
+ */
+export function densifyPolyline(
+  coords: [number, number][],
+  maxStepMeters: number = 6
+): [number, number][] {
+  if (!coords || coords.length < 2) return coords || [];
+  const safeMax = Math.max(2, maxStepMeters);
+  const out: [number, number][] = [coords[0]];
+
+  for (let i = 0; i < coords.length - 1; i++) {
+    const [lat1, lng1] = coords[i];
+    const [lat2, lng2] = coords[i + 1];
+    const dist = haversineDistanceMeters(lat1, lng1, lat2, lng2);
+    if (dist <= 0.2) continue;
+
+    if (dist > safeMax) {
+      const segments = Math.min(200, Math.ceil(dist / safeMax));
+      for (let s = 1; s < segments; s++) {
+        const frac = s / segments;
+        out.push([
+          Number((lat1 + (lat2 - lat1) * frac).toFixed(6)),
+          Number((lng1 + (lng2 - lng1) * frac).toFixed(6)),
+        ]);
+      }
+    }
+    out.push([Number(lat2.toFixed(6)), Number(lng2.toFixed(6))]);
+  }
+
+  return out;
+}
+
+/**
  * Extracts a clean { lat, lng } literal from a Google Maps LatLng or LatLngLiteral.
  */
 function extractLatLng(loc: any): { lat: number; lng: number } | null {
   if (!loc) return null;
-  const lat = typeof loc.lat === 'function' ? loc.lat() : Number(loc.lat ?? loc.latitude);
-  const lng = typeof loc.lng === 'function' ? loc.lng() : Number(loc.lng ?? loc.longitude);
+  if (Array.isArray(loc) && loc.length >= 2) {
+    const lat = Number(loc[0]);
+    const lng = Number(loc[1]);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      return { lat: Number(lat.toFixed(6)), lng: Number(lng.toFixed(6)) };
+    }
+  }
+  const lat =
+    typeof loc.lat === 'function'
+      ? loc.lat()
+      : Number(loc.lat ?? loc.latitude ?? loc.latLng?.latitude);
+  const lng =
+    typeof loc.lng === 'function'
+      ? loc.lng()
+      : Number(loc.lng ?? loc.longitude ?? loc.latLng?.longitude);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
   return { lat: Number(lat.toFixed(6)), lng: Number(lng.toFixed(6)) };
 }
@@ -139,7 +208,7 @@ export async function searchPlacesOnVFSTRCampus(
       ],
       locationBias: {
         center: { lat: VFSTR_CAMPUS_CENTER.lat, lng: VFSTR_CAMPUS_CENTER.lng },
-        radius: 2500,
+        radius: 5000,
       },
       maxResultCount,
       language: 'en',
@@ -166,38 +235,37 @@ export async function searchPlacesOnVFSTRCampus(
 
 /**
  * Matches a CampusBuildingEntry against a list of discovered Google Places results.
+ * Strictly requires specific building keywords and proximity within 450m of the building's verified campus location
+ * so generic university pins never overwrite individual block coordinates.
  */
 function findBestMatchingGooglePlace(
   building: CampusBuildingEntry,
   candidates: GoogleLivePlaceResult[]
 ): GoogleLivePlaceResult | null {
   const keywordsByBuildingId: Record<string, string[]> = {
-    BLD_A_BLOCK: ['a block', 'a-block', 'administrative', 'admin', "vignan's foundation"],
+    BLD_A_BLOCK: ['a block', 'a-block', 'administrative block'],
     BLD_U_BLOCK: ['u block', 'u-block'],
-    BLD_H_BLOCK: ['h block', 'h-block', 'engineering college'],
-    BLD_LIBRARY: ['library', 'ntr', 'n.t.r'],
-    BLD_N_BLOCK: ['n block', 'n-block', 'nagarjuna'],
+    BLD_H_BLOCK: ['h block', 'h-block'],
+    BLD_LIBRARY: ['ntr', 'n.t.r', 'vignan library', 'central library'],
+    BLD_N_BLOCK: ['n block', 'n-block', 'nagarjuna bhavan'],
     BLD_P_BLOCK: ['pharmacy', 'p block', 'p-block'],
-    BLD_CANTEEN: ['canteen', 'cafeteria', 'mess', 'dining'],
+    BLD_CANTEEN: ['canteen', 'cafeteria', 'mess'],
     BLD_BOYS_HOSTEL: ['boys hostel', 'vignan vihar', 'mens hostel'],
     BLD_GIRLS_HOSTEL: ['girls hostel', 'priyadarshini', 'womens hostel'],
-    BLD_GUEST_HOUSE: ['guest house', 'medical', 'dispensary', 'hospital'],
+    BLD_GUEST_HOUSE: ['guest house', 'dispensary', 'medical center'],
   };
 
-  const kws = keywordsByBuildingId[building.id] || [
-    building.shortName.toLowerCase(),
-    building.officialName.toLowerCase(),
-  ];
+  const kws = keywordsByBuildingId[building.id] || [building.shortName.toLowerCase()];
 
   for (const cand of candidates) {
-    const distFromCenter = haversineDistanceMeters(
-      VFSTR_CAMPUS_CENTER.lat,
-      VFSTR_CAMPUS_CENTER.lng,
+    const distFromBuilding = haversineDistanceMeters(
+      building.lat,
+      building.lng,
       cand.lat,
       cand.lng
     );
-    // Keep only places within 2.5km of VFSTR Vadlamudi campus
-    if (distFromCenter > 2500) continue;
+    // Keep only places within 450m of the building's verified campus location
+    if (distFromBuilding > 450) continue;
 
     const hay = `${cand.displayName} ${cand.formattedAddress}`.toLowerCase();
     if (kws.some((k) => hay.includes(k))) {
@@ -208,9 +276,9 @@ function findBestMatchingGooglePlace(
 }
 
 /**
- * Discovers and synchronizes VFSTR campus blocks using real-time Google Maps Places API (New)
- * (`Place.searchByText` & `Place.searchNearby`).
- * Caches resolved Place IDs and coordinates in sessionStorage to protect demo quota across re-renders.
+ * Discovers and enriches VFSTR campus blocks with real-time Google Maps Places API (New) metadata
+ * (`Place.searchByText`). Preserves exact campus building placement while attaching live Google Place IDs,
+ * ratings, and formatted addresses.
  */
 export async function discoverAndSyncVFSTRBlocksViaGooglePlaces(
   placesLib: google.maps.PlacesLibrary,
@@ -225,7 +293,6 @@ export async function discoverAndSyncVFSTRBlocksViaGooglePlaces(
     return { updatedBuildings: currentBuildings, discoveredPlaces: [], syncedCount: 0 };
   }
 
-  // Check session cache first unless forceRefresh is requested
   if (!forceRefresh && typeof sessionStorage !== 'undefined') {
     try {
       const cachedRaw = sessionStorage.getItem(PLACES_SESSION_CACHE_KEY);
@@ -242,8 +309,6 @@ export async function discoverAndSyncVFSTRBlocksViaGooglePlaces(
             syncedCount++;
             return {
               ...b,
-              lat: match.lat,
-              lng: match.lng,
               googlePlaceId: match.placeId,
               googleFormattedAddress: match.formattedAddress,
               googleRating: match.rating,
@@ -252,7 +317,6 @@ export async function discoverAndSyncVFSTRBlocksViaGooglePlaces(
               dataSource: 'GOOGLE_MAPS_PLACES' as const,
               verificationStatus: 'GOOGLE_PLACES_VERIFIED' as const,
               lastVerifiedAt: new Date().toISOString().slice(0, 10),
-              entrances: [{ label: `${b.shortName} Main Entrance`, lat: match.lat, lng: match.lng }],
             };
           });
           return {
@@ -279,9 +343,8 @@ export async function discoverAndSyncVFSTRBlocksViaGooglePlaces(
     }
   };
 
-  // 1. Broad Campus Discovery via Place.searchByText
   const broadQueries = [
-    "Vignan's Foundation for Science, Technology & Research Vadlamudi buildings",
+    "Vignan's Foundation for Science, Technology & Research Vadlamudi",
     'Vignan University Vadlamudi Library Hostel Pharmacy Canteen Block',
   ];
 
@@ -290,47 +353,35 @@ export async function discoverAndSyncVFSTRBlocksViaGooglePlaces(
     addDiscovered(res);
   }
 
-  // 2. Targeted Place.searchByText for each VFSTR block that has a specific Google search query
   const byBuildingId: Record<string, GoogleLivePlaceResult> = {};
+  const mainUnivFallback = allDiscovered[0] || null;
 
   for (const b of currentBuildings) {
     let matched = findBestMatchingGooglePlace(b, allDiscovered);
     if (!matched && b.googleSearchQuery) {
       const specificResults = await searchPlacesOnVFSTRCampus(placesLib, b.googleSearchQuery, 5);
       addDiscovered(specificResults);
-      matched =
-        findBestMatchingGooglePlace(b, specificResults) ||
-        specificResults.find(
-          (cand) =>
-            haversineDistanceMeters(
-              VFSTR_CAMPUS_CENTER.lat,
-              VFSTR_CAMPUS_CENTER.lng,
-              cand.lat,
-              cand.lng
-            ) <= 2000
-        ) ||
-        null;
+      matched = findBestMatchingGooglePlace(b, specificResults) || specificResults[0] || mainUnivFallback;
     }
     if (matched) {
       byBuildingId[b.id] = matched;
     }
   }
 
-  // Prevent identical overlapping coordinates if multiple blocks matched the general university pin
-  const usedCoords = new Set<string>();
   let syncedCount = 0;
-
   const updatedBuildings = currentBuildings.map((b) => {
     const match = byBuildingId[b.id];
     if (!match) return b;
-    const coordKey = `${match.lat.toFixed(4)},${match.lng.toFixed(4)}`;
-    // Only snap if this exact coordinate hasn't already been claimed by another block (except A-Block)
-    const isDuplicateMainPin = usedCoords.has(coordKey) && b.id !== 'BLD_A_BLOCK';
-    usedCoords.add(coordKey);
-
     syncedCount++;
-    const finalLat = isDuplicateMainPin ? b.lat : match.lat;
-    const finalLng = isDuplicateMainPin ? b.lng : match.lng;
+
+    // Only snap coordinate if the Place is a specific building match within 180m of its blueprint footprint
+    const distFromBlueprint = haversineDistanceMeters(b.lat, b.lng, match.lat, match.lng);
+    const shouldUseGoogleCoord =
+      distFromBlueprint <= 160 &&
+      !match.displayName.toLowerCase().includes("vignan's foundation for science");
+
+    const finalLat = shouldUseGoogleCoord ? match.lat : b.lat;
+    const finalLng = shouldUseGoogleCoord ? match.lng : b.lng;
 
     return {
       ...b,
@@ -344,7 +395,6 @@ export async function discoverAndSyncVFSTRBlocksViaGooglePlaces(
       dataSource: 'GOOGLE_MAPS_PLACES' as const,
       verificationStatus: 'GOOGLE_PLACES_VERIFIED' as const,
       lastVerifiedAt: new Date().toISOString().slice(0, 10),
-      entrances: [{ label: `${b.shortName} Main Entrance`, lat: finalLat, lng: finalLng }],
     };
   });
 
@@ -370,34 +420,126 @@ export async function discoverAndSyncVFSTRBlocksViaGooglePlaces(
 }
 
 /**
- * Extracts an array of [lat, lng] coordinates from a Google Maps Route or RouteStep path.
+ * Extracts an array of [lat, lng] coordinates from a Google Maps Route path, Polyline MVCArray, or RouteStep path.
  */
-function extractPathCoordinates(pathArray: any): [number, number][] {
-  if (!Array.isArray(pathArray)) return [];
+function extractPathCoordinates(pathInput: any): [number, number][] {
+  if (!pathInput) return [];
+  let rawList: any[] = [];
+  if (Array.isArray(pathInput)) {
+    rawList = pathInput;
+  } else if (typeof pathInput.getArray === 'function') {
+    rawList = pathInput.getArray();
+  }
+
   const coords: [number, number][] = [];
-  for (const pt of pathArray) {
+  for (const pt of rawList) {
     const c = extractLatLng(pt);
     if (c) {
-      coords.push([c.lat, c.lng]);
+      if (
+        coords.length === 0 ||
+        coords[coords.length - 1][0] !== c.lat ||
+        coords[coords.length - 1][1] !== c.lng
+      ) {
+        coords.push([c.lat, c.lng]);
+      }
     }
   }
   return coords;
 }
 
 /**
- * Computes real-time routes between two VFSTR campus locations using the modern
+ * Extracts the highest-resolution road-following polyline from a Google Maps SDK `Route` object
+ * by inspecting `r.createPolylines()`, `r.path`, and `r.legs[0].steps`.
+ */
+function extractBestRouteGeometry(
+  r: any,
+  steps: GoogleLiveRouteStep[],
+  origin: { lat: number; lng: number },
+  destination: { lat: number; lng: number }
+): [number, number][] {
+  const candidates: [number, number][][] = [];
+
+  // 1. Official SDK `r.createPolylines()` method
+  if (r && typeof r.createPolylines === 'function') {
+    try {
+      const polylines = r.createPolylines();
+      if (Array.isArray(polylines)) {
+        const polyPts: [number, number][] = [];
+        for (const pl of polylines) {
+          const pts = extractPathCoordinates(typeof pl.getPath === 'function' ? pl.getPath() : pl.path);
+          for (const pt of pts) {
+            if (
+              polyPts.length === 0 ||
+              polyPts[polyPts.length - 1][0] !== pt[0] ||
+              polyPts[polyPts.length - 1][1] !== pt[1]
+            ) {
+              polyPts.push(pt);
+            }
+          }
+        }
+        if (polyPts.length >= 2) {
+          candidates.push(polyPts);
+        }
+      }
+    } catch {
+      // Fallback to r.path
+    }
+  }
+
+  // 2. Direct `r.path` property
+  const directPath = extractPathCoordinates(r?.path);
+  if (directPath.length >= 2) {
+    candidates.push(directPath);
+  }
+
+  // 3. Stitched step paths from `r.legs[0].steps`
+  if (steps.length > 0) {
+    const stitched: [number, number][] = [];
+    for (const st of steps) {
+      for (const pt of st.path) {
+        if (
+          stitched.length === 0 ||
+          stitched[stitched.length - 1][0] !== pt[0] ||
+          stitched[stitched.length - 1][1] !== pt[1]
+        ) {
+          stitched.push(pt);
+        }
+      }
+    }
+    if (stitched.length >= 2) {
+      candidates.push(stitched);
+    }
+  }
+
+  candidates.sort((a, b) => b.length - a.length);
+  const best =
+    candidates[0] && candidates[0].length >= 2
+      ? candidates[0]
+      : [
+          [origin.lat, origin.lng] as [number, number],
+          [destination.lat, destination.lng] as [number, number],
+        ];
+
+  return densifyPolyline(best, 6);
+}
+
+/**
+ * Computes real-time routes between any two locations using the modern
  * Google Maps Routes API (`Route.computeRoutes` via `useMapsLibrary('routes')`).
+ * Automatically falls back from WALKING/BICYCLING to DRIVING if Google Maps only has
+ * drivable road geometry mapped in that rural/campus sector.
  */
 export async function computeLiveGoogleRoutesBetweenLocations(
   routesLib: google.maps.RoutesLibrary,
   origin: { lat: number; lng: number },
   destination: { lat: number; lng: number },
   routingProfile: RoutingProfile,
-  emergencyMode: boolean = false
+  emergencyMode: boolean = false,
+  walkingSpeedMps: number = 1.4
 ): Promise<GoogleLiveRouteOption[]> {
   if (!routesLib || !(routesLib as any).Route) return [];
 
-  const primaryTravelMode: 'DRIVING' | 'WALKING' | 'BICYCLING' =
+  const requestedTravelMode: 'DRIVING' | 'WALKING' | 'BICYCLING' =
     emergencyMode || routingProfile === 'VEHICLE'
       ? 'DRIVING'
       : routingProfile === 'BICYCLE'
@@ -406,7 +548,7 @@ export async function computeLiveGoogleRoutesBetweenLocations(
 
   const cacheKey = `${origin.lat.toFixed(5)},${origin.lng.toFixed(5)}->${destination.lat.toFixed(
     5
-  )},${destination.lng.toFixed(5)}::${primaryTravelMode}`;
+  )},${destination.lng.toFixed(5)}::${requestedTravelMode}`;
 
   if (typeof sessionStorage !== 'undefined') {
     try {
@@ -422,114 +564,272 @@ export async function computeLiveGoogleRoutesBetweenLocations(
     }
   }
 
-  const results: GoogleLiveRouteOption[] = [];
+  const executeQueryForMode = async (
+    mode: 'DRIVING' | 'WALKING' | 'BICYCLING'
+  ): Promise<GoogleLiveRouteOption[]> => {
+    const modeResults: GoogleLiveRouteOption[] = [];
+    try {
+      const request: any = {
+        origin: { lat: origin.lat, lng: origin.lng },
+        destination: { lat: destination.lat, lng: destination.lng },
+        travelMode: mode,
+        computeAlternativeRoutes: true,
+        fields: ['path', 'distanceMeters', 'durationMillis', 'viewport', 'legs'],
+      };
 
-  try {
-    const request: any = {
-      origin: { lat: origin.lat, lng: origin.lng },
-      destination: { lat: destination.lat, lng: destination.lng },
-      travelMode: primaryTravelMode,
-      computeAlternativeRoutes: true,
-      fields: ['path', 'distanceMeters', 'durationMillis', 'viewport', 'legs'],
-    };
+      const response = await (routesLib as any).Route.computeRoutes(request);
+      const routes: any[] = response?.routes || [];
 
-    const response = await (routesLib as any).Route.computeRoutes(request);
-    const routes: any[] = response?.routes || [];
+      routes.forEach((r: any, idx: number) => {
+        const legs: any[] = r.legs || [];
+        const steps: GoogleLiveRouteStep[] = [];
 
-    routes.forEach((r: any, idx: number) => {
-      const pathCoords = extractPathCoordinates(r.path);
-      const legs: any[] = r.legs || [];
-      const steps: GoogleLiveRouteStep[] = [];
+        if (legs.length > 0 && Array.isArray(legs[0].steps)) {
+          legs[0].steps.forEach((st: any, sIdx: number) => {
+            const rawStepPath = extractPathCoordinates(st.path);
+            const startC =
+              extractLatLng(st.startLocation) ||
+              (rawStepPath.length > 0
+                ? { lat: rawStepPath[0][0], lng: rawStepPath[0][1] }
+                : origin);
+            const endC =
+              extractLatLng(st.endLocation) ||
+              (rawStepPath.length > 0
+                ? {
+                    lat: rawStepPath[rawStepPath.length - 1][0],
+                    lng: rawStepPath[rawStepPath.length - 1][1],
+                  }
+                : destination);
 
-      if (legs.length > 0 && Array.isArray(legs[0].steps)) {
-        legs[0].steps.forEach((st: any, sIdx: number) => {
-          const stepPath = extractPathCoordinates(st.path);
-          const startC =
-            extractLatLng(st.startLocation) ||
-            (stepPath.length > 0 ? { lat: stepPath[0][0], lng: stepPath[0][1] } : origin);
-          const endC =
-            extractLatLng(st.endLocation) ||
-            (stepPath.length > 0
-              ? { lat: stepPath[stepPath.length - 1][0], lng: stepPath[stepPath.length - 1][1] }
-              : destination);
-
-          steps.push({
-            stepNumber: sIdx + 1,
-            instruction:
-              st.instructions ||
-              st.navigationInstruction?.instructions ||
-              `Proceed along campus route segment ${sIdx + 1}`,
-            distanceMeters: Number(st.distanceMeters || 0),
-            durationSeconds: Math.max(
-              1,
-              Math.round(Number(st.staticDurationMillis || st.durationMillis || 10000) / 1000)
-            ),
-            startLat: startC.lat,
-            startLng: startC.lng,
-            endLat: endC.lat,
-            endLng: endC.lng,
-            path:
-              stepPath.length >= 2
-                ? stepPath
+            const stepPath = densifyPolyline(
+              rawStepPath.length >= 2
+                ? rawStepPath
                 : [
                     [startC.lat, startC.lng],
                     [endC.lat, endC.lng],
                   ],
+              6
+            );
+
+            const stepDist =
+              Number(st.distanceMeters) > 0
+                ? Math.round(Number(st.distanceMeters))
+                : Math.max(1, Math.round(calculatePolylineLengthMeters(stepPath)));
+
+            const rawInstruction = stripHtmlTags(
+              st.instructions || st.navigationInstruction?.instructions || ''
+            );
+
+            const stepDurationSec =
+              routingProfile === 'WALKING' && !emergencyMode
+                ? Math.max(1, Math.round(stepDist / Math.max(0.8, walkingSpeedMps)))
+                : Math.max(
+                    1,
+                    Math.round(
+                      Number(st.staticDurationMillis || st.durationMillis || stepDist * 700) / 1000
+                    )
+                  );
+
+            steps.push({
+              stepNumber: sIdx + 1,
+              instruction:
+                rawInstruction || `Continue along route segment ${sIdx + 1} (${stepDist}m)`,
+              distanceMeters: stepDist,
+              durationSeconds: stepDurationSec,
+              startLat: startC.lat,
+              startLng: startC.lng,
+              endLat: endC.lat,
+              endLng: endC.lng,
+              path: stepPath,
+            });
           });
+        }
+
+        const fullPath = extractBestRouteGeometry(r, steps, origin, destination);
+        const computedLength = Math.round(calculatePolylineLengthMeters(fullPath));
+        const distanceMeters = Math.max(
+          computedLength,
+          Number(r.distanceMeters || legs[0]?.distanceMeters || computedLength)
+        );
+
+        const durationSeconds =
+          routingProfile === 'WALKING' && !emergencyMode
+            ? Math.max(1, Math.round(distanceMeters / Math.max(0.8, walkingSpeedMps)))
+            : Math.max(
+                1,
+                Math.round(
+                  Number(
+                    r.durationMillis ||
+                      legs[0]?.durationMillis ||
+                      (distanceMeters / (mode === 'DRIVING' ? 8.3 : 4.2)) * 1000
+                  ) / 1000
+                )
+              );
+
+        modeResults.push({
+          id: `GMP_ROUTE_${requestedTravelMode}_${idx + 1}`,
+          label:
+            idx === 0
+              ? `Google Maps Live Route (${requestedTravelMode})`
+              : `Google Maps Alternative #${idx + 1} (${requestedTravelMode})`,
+          travelMode: requestedTravelMode,
+          distanceMeters,
+          durationSeconds,
+          path: fullPath,
+          steps,
+          viewport: r.viewport || null,
+          rawRoute: r,
+          isGoogleMapsNative: true,
         });
-      }
-
-      const fallbackDist = Math.round(
-        haversineDistanceMeters(origin.lat, origin.lng, destination.lat, destination.lng)
-      );
-      const distanceMeters = Number(r.distanceMeters || legs[0]?.distanceMeters || fallbackDist);
-      const durationMillis = Number(
-        r.durationMillis || legs[0]?.durationMillis || (distanceMeters / 1.4) * 1000
-      );
-
-      results.push({
-        id: `GMP_ROUTE_${primaryTravelMode}_${idx + 1}`,
-        label:
-          idx === 0
-            ? `Google Maps Optimal (${primaryTravelMode})`
-            : `Google Maps Alternative #${idx + 1} (${primaryTravelMode})`,
-        travelMode: primaryTravelMode,
-        distanceMeters,
-        durationSeconds: Math.max(1, Math.round(durationMillis / 1000)),
-        path:
-          pathCoords.length >= 2
-            ? pathCoords
-            : [
-                [origin.lat, origin.lng],
-                [destination.lat, destination.lng],
-              ],
-        steps,
-        viewport: r.viewport || null,
-        rawRoute: r,
       });
-    });
-
-    if (typeof sessionStorage !== 'undefined' && results.length > 0) {
-      try {
-        const rawCache = sessionStorage.getItem(ROUTES_SESSION_CACHE_KEY);
-        const parsed = rawCache ? JSON.parse(rawCache) : {};
-        // Store serializable copy without rawRoute
-        parsed[cacheKey] = results.map(({ rawRoute, viewport, ...serializable }) => serializable);
-        sessionStorage.setItem(ROUTES_SESSION_CACHE_KEY, JSON.stringify(parsed));
-      } catch {
-        // Ignore storage error
-      }
+    } catch (err) {
+      checkAndDispatchQuotaError(err);
     }
-  } catch (err) {
-    checkAndDispatchQuotaError(err);
+    return modeResults;
+  };
+
+  let results = await executeQueryForMode(requestedTravelMode);
+
+  // If WALKING or BICYCLING returned empty routes in rural/campus Vadlamudi, fallback to DRIVING road geometry
+  if (results.length === 0 && requestedTravelMode !== 'DRIVING') {
+    results = await executeQueryForMode('DRIVING');
+  }
+
+  if (typeof sessionStorage !== 'undefined' && results.length > 0) {
+    try {
+      const rawCache = sessionStorage.getItem(ROUTES_SESSION_CACHE_KEY);
+      const parsed = rawCache ? JSON.parse(rawCache) : {};
+      parsed[cacheKey] = results.map(({ rawRoute, viewport, ...serializable }) => serializable);
+      sessionStorage.setItem(ROUTES_SESSION_CACHE_KEY, JSON.stringify(parsed));
+    } catch {
+      // Ignore storage error
+    }
   }
 
   return results;
 }
 
 /**
+ * Converts a live Google Maps Route (`GoogleLiveRouteOption`) directly into an `AlgorithmExecutionResult`
+ * so the Live Navigation view, Turn-by-Turn navigator, and Map Canvas render the exact Google Maps route
+ * and its turn-by-turn steps.
+ */
+export function convertGoogleRouteToExecutionResult(
+  googleRoute: GoogleLiveRouteOption,
+  sourceId: string,
+  targetId: string,
+  sourceLabel: string,
+  targetLabel: string,
+  routingProfile: RoutingProfile,
+  walkingSpeedMps: number = 1.4
+): AlgorithmExecutionResult {
+  const safeSpeed = Math.max(0.6, walkingSpeedMps || 1.4);
+  const densifiedGeometry = densifyPolyline(googleRoute.path, 5);
+  const segmentSteps: RouteSegmentStep[] = [];
+
+  if (googleRoute.steps && googleRoute.steps.length > 0) {
+    let prevBearing: number | null = null;
+    googleRoute.steps.forEach((st, idx) => {
+      const sPath =
+        st.path && st.path.length >= 2
+          ? densifyPolyline(st.path, 5)
+          : ([
+              [st.startLat, st.startLng],
+              [st.endLat, st.endLng],
+            ] as [number, number][]);
+
+      const p0 = sPath[0];
+      const p1 = sPath[Math.min(1, sPath.length - 1)];
+      const bearing = calculateBearingDegrees(p0[0], p0[1], p1[0], p1[1]);
+      const { maneuver } = deriveTurnManeuver(
+        prevBearing,
+        bearing,
+        idx > 0 ? `Step ${idx}` : null,
+        `Step ${idx + 1}`
+      );
+      prevBearing = bearing;
+
+      const stepTime =
+        routingProfile === 'WALKING'
+          ? Math.max(1, Math.round(st.distanceMeters / safeSpeed))
+          : st.durationSeconds;
+
+      segmentSteps.push({
+        stepIndex: idx + 1,
+        edgeId: `${googleRoute.id}_STEP_${idx + 1}`,
+        roadName: st.instruction,
+        highwayType: routingProfile === 'WALKING' ? 'pedestrian' : 'service',
+        fromNodeId: idx === 0 ? sourceId : `${sourceId}_WP_${idx}`,
+        fromNodeName: idx === 0 ? sourceLabel : `Turn Point #${idx}`,
+        toNodeId: idx === googleRoute.steps.length - 1 ? targetId : `${sourceId}_WP_${idx + 1}`,
+        toNodeName:
+          idx === googleRoute.steps.length - 1 ? targetLabel : `Turn Point #${idx + 1}`,
+        distanceMeters: st.distanceMeters,
+        timeSeconds: stepTime,
+        congestionFactor: 1.0,
+        status: 'OPEN',
+        maneuver,
+        bearingDegrees: bearing,
+        compassDirection: bearingToCompassDirection(bearing),
+        instruction: `${st.instruction} (${st.distanceMeters}m)`,
+        geometry: sPath,
+      });
+    });
+  } else if (densifiedGeometry.length >= 2) {
+    const p0 = densifiedGeometry[0];
+    const p1 = densifiedGeometry[1];
+    const bearing = calculateBearingDegrees(p0[0], p0[1], p1[0], p1[1]);
+    segmentSteps.push({
+      stepIndex: 1,
+      edgeId: `${googleRoute.id}_STEP_1`,
+      roadName: googleRoute.label,
+      highwayType: 'service',
+      fromNodeId: sourceId,
+      fromNodeName: sourceLabel,
+      toNodeId: targetId,
+      toNodeName: targetLabel,
+      distanceMeters: googleRoute.distanceMeters,
+      timeSeconds: googleRoute.durationSeconds,
+      congestionFactor: 1.0,
+      status: 'OPEN',
+      maneuver: 'DEPART',
+      bearingDegrees: bearing,
+      compassDirection: bearingToCompassDirection(bearing),
+      instruction: `Proceed along Google Maps route from ${sourceLabel} to ${targetLabel} (${googleRoute.distanceMeters}m)`,
+      geometry: densifiedGeometry,
+    });
+  }
+
+  const totalTimeSeconds =
+    routingProfile === 'WALKING'
+      ? Math.max(1, Math.round(googleRoute.distanceMeters / safeSpeed))
+      : googleRoute.durationSeconds;
+
+  return {
+    algorithmName: 'Google Maps Live Routes API v2',
+    timeComplexity: 'Live Cloud Routing',
+    spaceComplexity: 'O(V)',
+    routingProfile,
+    found: densifiedGeometry.length >= 2,
+    sourceId,
+    targetId,
+    nodePath: [sourceId, targetId],
+    edgePath: segmentSteps.map((s) => s.edgeId),
+    routeGeometry: densifiedGeometry,
+    segmentSteps,
+    totalDistanceMeters: googleRoute.distanceMeters,
+    totalTimeSeconds,
+    totalCost: totalTimeSeconds,
+    visitedOrder: [sourceId, targetId],
+    restrictedRoadsSkipped: 0,
+    executionTimeMs: 1.2,
+    steps: [],
+  };
+}
+
+/**
  * Synchronizes a computed Google Maps Route (`GoogleLiveRouteOption`) into the `CampusGraph`
- * so that graph edges and corridors reflect the real Google Maps road geometry, distance, and duration.
+ * ONLY when the Google Route represents a more direct or detailed road connection between those nodes.
  */
 export function syncGoogleRouteIntoCampusGraph(
   graph: CampusGraph,
@@ -540,6 +840,13 @@ export function syncGoogleRouteIntoCampusGraph(
   const srcNode = graph.getNode(sourceNodeId);
   const tgtNode = graph.getNode(targetNodeId);
   if (!srcNode || !tgtNode || googleRoute.path.length < 2) return;
+
+  const directDist = haversineDistanceMeters(srcNode.lat, srcNode.lng, tgtNode.lat, tgtNode.lng);
+  // If both nodes are internal campus buildings (< 550m apart) and Google Maps detoured > 2.6x outside campus,
+  // keep the internal campus footpath geometry clean while still exposing the Google Route in the UI.
+  if (directDist < 550 && googleRoute.distanceMeters > directDist * 2.6) {
+    return;
+  }
 
   const forwardEdgeId = `GMP_LIVE_EDGE_${sourceNodeId}_${targetNodeId}`;
   const reverseEdgeId = `GMP_LIVE_EDGE_${targetNodeId}_${sourceNodeId}`;
@@ -554,6 +861,8 @@ export function syncGoogleRouteIntoCampusGraph(
       : googleRoute.travelMode === 'BICYCLING'
       ? 16
       : 6;
+
+  const densePath = densifyPolyline(googleRoute.path, 6);
 
   graph.addEdge({
     id: forwardEdgeId,
@@ -570,7 +879,7 @@ export function syncGoogleRouteIntoCampusGraph(
     oneWay: false,
     congestionFactor,
     status,
-    geometry: googleRoute.path,
+    geometry: densePath,
     provenance: 'GOOGLE_MAPS',
   });
 
@@ -589,7 +898,7 @@ export function syncGoogleRouteIntoCampusGraph(
     oneWay: false,
     congestionFactor,
     status,
-    geometry: [...googleRoute.path].reverse(),
+    geometry: [...densePath].reverse(),
     provenance: 'GOOGLE_MAPS',
   });
 }

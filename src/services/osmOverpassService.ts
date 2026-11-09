@@ -4,7 +4,7 @@ import {
 } from '../data/campusData';
 import { RawOverpassElement, RawOverpassResponse } from '../graph/osmGraphExtractor';
 
-const OVERPASS_CACHE_KEY = 'resqroute_vfstr_overpass_cache_v2';
+const OVERPASS_CACHE_KEY = 'resqroute_vfstr_overpass_cache_v4';
 const CACHE_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
 
 const OVERPASS_ENDPOINTS = [
